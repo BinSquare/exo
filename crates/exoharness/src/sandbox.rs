@@ -144,6 +144,13 @@ pub enum SnapshotKind {
 pub trait ManagedSandboxHandle: Send + Sync {
     fn id(&self) -> &str;
 
+    /// Whether this handle borrows a provider resource owned outside Exoharness.
+    /// Used to invalidate process-local handles when another Exoharness process
+    /// detaches an attachment and restores it as an owned sandbox.
+    fn is_borrowed(&self) -> bool {
+        false
+    }
+
     fn provider_state(&self) -> Option<Value> {
         None
     }
@@ -666,6 +673,10 @@ impl ManagedSandboxHandle for BorrowedDockerSandboxHandle {
         &self.id
     }
 
+    fn is_borrowed(&self) -> bool {
+        true
+    }
+
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
         inspect_running_docker_container(&self.container_bin, &self.container_id).await?;
         exec_warm(&self.container_bin, &self.container_id, &self.spec, command).await
@@ -687,7 +698,7 @@ impl ManagedSandboxHandle for BorrowedDockerSandboxHandle {
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
-        bail!("borrowed Docker containers cannot be snapshotted")
+        docker_snapshot_container(&self.container_bin, &self.container_id).await
     }
 }
 
@@ -2329,7 +2340,7 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn borrowed_docker_sandbox_execs_without_taking_container_ownership() {
+    async fn borrowed_docker_sandbox_execs_and_snapshots_without_taking_container_ownership() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2419,6 +2430,19 @@ esac
         assert!(args.contains("inspect\nharbor-task\n---"));
         assert!(args.contains("exec\n--workdir\n/task\ncanonical-id"));
         assert!(!args.lines().any(|arg| arg == "rm"));
+        assert!(!args.lines().any(|arg| arg == "stop"));
+        assert!(!args.lines().any(|arg| arg == "kill"));
+
+        let snapshot = handle
+            .snapshot()
+            .await
+            .expect("snapshot borrowed container");
+        assert_eq!(snapshot.kind, SnapshotKind::DockerImageTar);
+
+        let args = fs::read_to_string(&args_path).expect("read snapshot docker args");
+        assert!(args.contains("commit\n-p\ncanonical-id\nexo-snap-"));
+        assert!(args.contains("save\nexo-snap-"));
+        assert!(args.contains("image\nrm\nexo-snap-"));
         assert!(!args.lines().any(|arg| arg == "stop"));
         assert!(!args.lines().any(|arg| arg == "kill"));
     }
