@@ -69,19 +69,6 @@ fn malformed_references_fail_before_accessing_host_paths() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn snapshot_budget_counts_allocated_blocks_in_sparse_images() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let mut file = File::create(temp.path().join("disk"))?;
-    file.set_len(96 * 1024 * 1024 * 1024)?;
-    file.write_all(b"written extent")?;
-    file.sync_all()?;
-    let allocated = allocated_bytes(temp.path())?;
-    assert!(allocated > 0);
-    assert!(allocated < 1024 * 1024);
-    Ok(())
-}
-
 #[cfg(target_os = "linux")]
 fn native_request(config: &FirecrackerConfig, id: &str, image: &str) -> Result<SandboxRequest> {
     let agent_id = crate::Uuid7::now();
@@ -355,30 +342,69 @@ fn capture_rejects_runtimes_with_the_vsock_resume_bug() {
     assert!(validate_capture_runtime("v1.17.0").is_ok());
 }
 
-#[tokio::test]
-async fn startup_collection_preserves_cataloged_captures() -> Result<()> {
+#[test]
+fn collection_preserves_cataloged_captures_and_checks_manifest_paths() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = FirecrackerConfig {
+        state_root: temp.path().into(),
+        ..Default::default()
+    };
+    let kept = fixture(&config)?;
+    let mut orphan = FilesystemManifest::from_payload(&kept)?;
+    orphan.sandbox_id = "another-sandbox".into();
+    let target = orphan.directory(&config);
+    fs::create_dir_all(&target)?;
+    fs::write(target.join("manifest.json"), serde_json::to_vec(&orphan)?)?;
+    let mismatched = target.parent().unwrap().join("mismatched");
+    fs::create_dir(&mismatched)?;
+    fs::write(
+        mismatched.join("manifest.json"),
+        serde_json::to_vec(&orphan)?,
+    )?;
+    assert_eq!(collect_captures(&config, vec![kept.clone()])?, 1);
+    assert!(!target.exists());
+    assert!(mismatched.exists());
+    assert!(open_capture(&config, kept).is_ok());
+    Ok(())
+}
+
+#[test]
+fn filesystem_and_memory_captures_share_a_budget_without_charging_external_base_links() -> Result<()>
+{
     let temp = tempfile::tempdir()?;
     let config = FirecrackerConfig {
         state_root: temp.path().into(),
         ..Default::default()
     };
     let payload = fixture(&config)?;
-    let kept = FilesystemManifest::from_payload(&payload)?.key;
-    let mut orphan = FilesystemManifest::from_payload(&payload)?;
-    orphan.key = "c".repeat(64);
-    let source = FilesystemManifest::from_payload(&payload)?.directory(&config);
-    let target = orphan.directory(&config);
-    fs::create_dir_all(&target)?;
-    for file in ["lease", "base.ext4", "overlay.ext4"] {
-        fs::copy(source.join(file), target.join(file))?;
-    }
-    fs::write(target.join("manifest.json"), serde_json::to_vec(&orphan)?)?;
-    assert!(source.to_string_lossy().contains(&kept));
-    let lease = open_capture(&config, orphan.payload()?)?;
-    assert!(collect_captures(&config, vec![payload.clone()]).is_err());
-    drop(lease);
-    assert_eq!(collect_captures(&config, vec![payload.clone()])?, 1);
-    assert_eq!(collect_captures(&config, vec![payload.clone()])?, 0);
-    assert!(open_capture(&config, payload).is_ok());
+    let mut manifest = FilesystemManifest::from_payload(&payload)?;
+    let first = manifest.directory(&config);
+    let cache = temp.path().join("images/rootfs.ext4");
+    fs::create_dir_all(cache.parent().unwrap())?;
+    fs::write(&cache, [7; 4096])?;
+    File::open(&cache)?.sync_all()?;
+    fs::remove_file(first.join("base.ext4"))?;
+    fs::hard_link(&cache, first.join("base.ext4"))?;
+    manifest.key = "d".repeat(64);
+    let second = manifest.directory(&config);
+    fs::create_dir_all(&second)?;
+    fs::hard_link(&cache, second.join("base.ext4"))?;
+    let snapshots = temp.path().join("snapshots");
+    fs::create_dir(&snapshots)?;
+    fs::write(snapshots.join("memory"), [9; 4096])?;
+    File::open(snapshots.join("memory"))?.sync_all()?;
+    let base_bytes = fs::metadata(&cache)?.blocks() * 512;
+    let pool_bytes = snapshot_directory_bytes(
+        &config.state_root.join("filesystem-snapshots"),
+        &mut HashSet::new(),
+    )?;
+    let memory_bytes = snapshot_directory_bytes(&snapshots, &mut HashSet::new())?;
+    assert!(base_bytes > 0 && memory_bytes > 0);
+    assert_eq!(
+        retained_snapshot_bytes(&config)?,
+        pool_bytes + memory_bytes - base_bytes
+    );
+    fs::remove_file(cache)?;
+    assert_eq!(retained_snapshot_bytes(&config)?, pool_bytes + memory_bytes);
     Ok(())
 }

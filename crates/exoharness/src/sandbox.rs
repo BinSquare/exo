@@ -478,6 +478,7 @@ pub trait ManagedSandboxBackend: Send + Sync {
     /// Capture the requested state and release execution resources. Restore it
     /// with acquire_from_snapshot; unsupported kinds must leave the source intact.
     /// The returned snapshot has its own lifetime and is deleted with delete_snapshot.
+    /// Used by the hosted sandbox service to checkpoint before releasing a VM.
     async fn suspend(
         &self,
         _request: SandboxRequest,

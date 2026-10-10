@@ -63,6 +63,7 @@ const SMOLVM_BOOT_BIN_ENV: &str = "SMOLVM_BOOT_BINARY";
 /// First smolvm release whose client drains the agent's `Progress` frames during
 /// a detached start, which is what warm mode needs; see [`SmolvmExecutionMode::Warm`].
 const MIN_WARM_VERSION: Version = Version::new(1, 7, 2);
+const MIN_FILESYSTEM_SNAPSHOT_VERSION: Version = Version::new(1, 20, 0);
 
 /// Probed from `--help`, not the version: a build carrying `--label` still
 /// reported 1.7.5, so a version gate would refuse a flag that is right there.
@@ -82,6 +83,7 @@ struct Capabilities {
     labels: bool,
     interceptor: bool,
     host_patterns: bool,
+    filesystem_snapshots: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -149,13 +151,21 @@ pub struct SmolvmSandboxBackend {
     egress: Arc<EgressRuntime<SmolvmWarmHandle, SmolvmProxy>>,
 }
 
+enum MachineSource<'a> {
+    Image(&'a str),
+    #[cfg(unix)]
+    Pack(&'a Path),
+}
+
 impl SmolvmSandboxBackend {
+    /// Used by the hosted sandbox service for local checkpoint garbage collection.
     #[cfg(unix)]
     pub async fn collect_filesystem_snapshots(&self, keep: Vec<SnapshotPayload>) -> Result<usize> {
         let root = self.snapshot_root.clone();
         tokio::task::spawn_blocking(move || filesystem::collect(&root, &keep)).await?
     }
 
+    /// Used by the hosted sandbox service to validate and account for local checkpoints.
     #[cfg(unix)]
     pub async fn filesystem_snapshot_allocated_bytes(
         &self,
@@ -165,11 +175,12 @@ impl SmolvmSandboxBackend {
         tokio::task::spawn_blocking(move || {
             let manifest = filesystem::Manifest::parse(&payload)?;
             let lease = filesystem::open(&root, &manifest)?;
-            filesystem::allocated(&lease.directory)
+            super::capture_store::allocated(&lease.directory)
         })
         .await?
     }
 
+    /// Used by the hosted sandbox service to clean up owned VMs at startup.
     pub async fn terminate_all_owned(&self) -> Result<usize> {
         let machines = listed_machines(self.binary().await?).await?;
         let namespace = self.snapshot_root.to_string_lossy();
@@ -339,11 +350,16 @@ impl SmolvmSandboxBackend {
         Ok(self
             .capabilities
             .get_or_init(|| async {
+                let version = self.probe_version().await;
                 Capabilities {
-                    warm: self
-                        .probe_version()
-                        .await
-                        .is_some_and(|version| version >= MIN_WARM_VERSION),
+                    warm: version
+                        .as_ref()
+                        .is_some_and(|version| *version >= MIN_WARM_VERSION),
+                    filesystem_snapshots: version
+                        .is_some_and(|version| version >= MIN_FILESYSTEM_SNAPSHOT_VERSION)
+                        && self
+                            .probe_flag("pack", "create", "--include-workspace")
+                            .await,
                     labels: self.probe_flag("machine", "create", LABEL_FLAG).await,
                     interceptor: self.probe_flag("machine", "start", INTERCEPTOR_FLAG).await,
                     host_patterns: self
@@ -464,20 +480,25 @@ impl SmolvmSandboxBackend {
 
     /// Boot the machine backing `name`, creating it first when absent.
     ///
-    /// Idempotent by *result*, not by pre-check: two `acquire`s for one key race,
-    /// and the winner's machine is exactly what the loser wanted.
+    /// Image starts may reuse an existing machine; pack restores require a new one.
     async fn ensure_machine_started(
         &self,
         name: &str,
-        spec: &SandboxSpec,
-        key: &str,
-        image: &str,
-        egress: Option<&SandboxEgress<SmolvmProxy>>,
-    ) -> Result<BTreeMap<u16, u16>> {
-        let mut create = Command::new(self.binary().await?);
+        request: SandboxRequest,
+        source: MachineSource<'_>,
+        egress: Option<Arc<SandboxEgress<SmolvmProxy>>>,
+    ) -> Result<SmolvmWarmHandle> {
+        let binary = self.binary().await?;
+        let spec = &request.spec;
+        let allow_reuse = matches!(source, MachineSource::Image(_));
+        let mut create = Command::new(binary);
         create.arg("machine").arg("create").arg("--name").arg(name);
-        create.arg("--image").arg(image);
-        self.stamp_labels(&mut create, key).await;
+        match source {
+            MachineSource::Image(image) => create.arg("--image").arg(image),
+            #[cfg(unix)]
+            MachineSource::Pack(pack) => create.arg("--from").arg(pack),
+        };
+        self.stamp_labels(&mut create, &request.sandbox_id).await;
         configure_spec_args(&mut create, spec, self.storage_gib, self.overlay_gib)?;
         let exact_host_policy = exact_host_policy_fingerprint(&spec.policy.networking)?;
         if let Some(policy) = &exact_host_policy {
@@ -501,7 +522,7 @@ impl SmolvmSandboxBackend {
         drop(reservations);
         let host_ports = if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !cli_says::already_exists(&stderr) {
+            if !allow_reuse || !cli_says::already_exists(&stderr) {
                 bail!("smolvm machine create failed: {}", stderr.trim());
             }
             self.existing_tcp_forwards(name, &spec.tcp_ports, exact_host_policy.as_deref())
@@ -513,24 +534,36 @@ impl SmolvmSandboxBackend {
             stop_machine(self.binary().await?, name).await?;
         }
 
-        let mut start = Command::new(self.binary().await?);
+        let mut start = Command::new(binary);
         start.arg("machine").arg("start").arg("--name").arg(name);
-        if let Some(egress) = egress {
+        if let Some(egress) = &egress {
             egress.proxy.configure(&mut start);
         }
         let output = start.output().await.context("spawn smolvm machine start")?;
-        if output.status.success() {
-            return Ok(host_ports);
-        }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Already up is the caller's intent, not an error.
-        if egress.is_none() && cli_says::already_running(&stderr) {
-            return Ok(host_ports);
-        }
-        bail!(
+        ensure!(
+            output.status.success()
+                || (allow_reuse && egress.is_none() && cli_says::already_running(&stderr)),
             "smolvm machine start failed for '{name}': {}",
             stderr.trim()
         );
+        let mut handle = SmolvmWarmHandle {
+            #[cfg(unix)]
+            snapshot_lock: tokio::sync::Mutex::new(()),
+            snapshot_root: self.snapshot_root.clone(),
+            filesystem_snapshots: self.capabilities().await?.filesystem_snapshots,
+            id: format!("smolvm:{name}"),
+            binary: binary.clone(),
+            machine: name.to_owned(),
+            request,
+            egress: None,
+            host_ports,
+        };
+        if let Some(egress) = egress {
+            egress.initialize_trust(&handle).await?;
+            handle.egress = Some(egress);
+        }
+        Ok(handle)
     }
 
     async fn existing_tcp_forwards(
@@ -628,6 +661,7 @@ impl SmolvmSandboxBackend {
     /// Record which sandbox a machine serves. The creator's PID cannot identify
     /// the owner after another process resumes a machine, so cleanup belongs to
     /// the session lifecycle and thread deletion. A no-op without `--label`.
+    /// The state-root label identifies VMs for hosted service startup cleanup.
     async fn stamp_labels(&self, command: &mut Command, key: &str) {
         if !self.labels_supported().await {
             return;
@@ -644,6 +678,15 @@ impl SmolvmSandboxBackend {
     /// match could never hit — and asking outright has no check-then-act race.
     async fn delete_machine_if_present(&self, name: &str) -> Result<()> {
         delete_machine_if_present(self.binary().await?, name).await
+    }
+
+    async fn cleanup_restore_failure(&self, name: &str, error: anyhow::Error) -> anyhow::Error {
+        match self.delete_machine_if_present(name).await {
+            Ok(()) => error,
+            Err(cleanup) => {
+                error.context(format!("filesystem restore cleanup failed: {cleanup:#}"))
+            }
+        }
     }
 }
 
@@ -674,10 +717,9 @@ async fn listed_machines(binary: &Path) -> Result<Vec<ListedMachine>> {
     }
     let parsed: MachineList =
         serde_json::from_slice(&output.stdout).context("parse smolvm machine ls --json")?;
-    let items = match parsed {
+    Ok(match parsed {
         MachineList::Direct(machines) | MachineList::Wrapped { machines } => machines,
-    };
-    Ok(items)
+    })
 }
 
 async fn stop_machine(binary: &Path, name: &str) -> Result<()> {
@@ -816,29 +858,13 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
                 |egress| async {
                     let image = self.prepare_image(&request.spec.image).await?;
                     reject_unsupported_spec(&request.spec, &image)?;
-                    let host_ports = self
-                        .ensure_machine_started(
-                            &machine,
-                            &request.spec,
-                            &request.sandbox_id,
-                            &image,
-                            egress.as_deref(),
-                        )
-                        .await?;
-                    let mut handle = SmolvmWarmHandle {
-                        snapshot_root: self.snapshot_root.clone(),
-                        id: format!("smolvm:{machine}"),
-                        binary: binary.clone(),
-                        machine: machine.clone(),
-                        request: request.clone(),
-                        egress: None,
-                        host_ports,
-                    };
-                    if let Some(egress) = egress {
-                        egress.initialize_trust(&handle).await?;
-                        handle.egress = Some(egress);
-                    }
-                    Ok(handle)
+                    self.ensure_machine_started(
+                        &machine,
+                        request.clone(),
+                        MachineSource::Image(&image),
+                        egress,
+                    )
+                    .await
                 },
                 self.delete_machine_if_present(&machine),
             )
@@ -928,7 +954,11 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         }
 
         let manifest = filesystem::Manifest::parse(&payload)?;
-        let lease = filesystem::open(&self.snapshot_root, &manifest)?;
+        let root = self.snapshot_root.clone();
+        let manifest_for_open = manifest.clone();
+        let lease =
+            tokio::task::spawn_blocking(move || filesystem::open(&root, &manifest_for_open))
+                .await??;
         let machine = machine_name(request.sandbox_id.as_str());
         let mut status = Command::new(binary);
         status.args(["machine", "status", "--name", &machine, "--json"]);
@@ -938,6 +968,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
                 && cli_says::no_such_machine(&String::from_utf8_lossy(&status.stderr)),
             "snapshot restore target already exists or cannot be inspected"
         );
+        let mut restored_mounts = None;
         let handle = self
             .egress
             .restore_with_proxy(
@@ -949,65 +980,41 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
                     let pack_path = lease.directory.join("machine.smolmachine");
                     let capture_directory = lease.directory.clone();
                     let manifest = manifest.clone();
-                    request = tokio::task::spawn_blocking(move || {
-                        filesystem::restore_mounts(&capture_directory, &manifest, &mut request)?;
-                        Ok::<_, anyhow::Error>(request)
+                    let (restored_request, mounts) = tokio::task::spawn_blocking(move || {
+                        let mounts = filesystem::restore_mounts(
+                            &capture_directory,
+                            &manifest,
+                            &mut request,
+                        )?;
+                        Ok::<_, anyhow::Error>((request, mounts))
                     })
                     .await??;
-                    let mut create = Command::new(binary);
-                    create
-                        .args(["machine", "create", "--name", &machine, "--from"])
-                        .arg(&pack_path);
-                    self.stamp_labels(&mut create, request.sandbox_id.as_str())
-                        .await;
-                    configure_spec_args(
-                        &mut create,
-                        &request.spec,
-                        self.storage_gib,
-                        self.overlay_gib,
-                    )?;
-                    if let Some(policy) =
-                        exact_host_policy_fingerprint(&request.spec.policy.networking)?
+                    request = restored_request;
+                    restored_mounts = Some(mounts);
+                    match self
+                        .ensure_machine_started(
+                            &machine,
+                            request,
+                            MachineSource::Pack(&pack_path),
+                            egress,
+                        )
+                        .await
                     {
-                        create
-                            .arg(LABEL_FLAG)
-                            .arg(format!("{EXACT_HOST_POLICY_LABEL}={policy}"));
+                        Ok(handle) => Ok(handle),
+                        Err(error) => Err(self.cleanup_restore_failure(&machine, error).await),
                     }
-                    let (host_ports, reservations) = self
-                        .configure_tcp_forwards(&mut create, &request.spec)
-                        .await?;
-                    run_checked(create, "smolvm machine create --from").await?;
-                    drop(reservations);
-                    let mut start = Command::new(binary);
-                    start.args(["machine", "start", "--name", &machine]);
-                    if let Some(egress) = &egress {
-                        egress.proxy.configure(&mut start);
-                    }
-                    if let Err(error) = run_checked(start, "smolvm machine start").await {
-                        self.delete_machine_if_present(&machine).await?;
-                        return Err(error);
-                    }
-                    let mut handle = SmolvmWarmHandle {
-                        snapshot_root: self.snapshot_root.clone(),
-                        id: format!("smolvm:{machine}"),
-                        binary: binary.clone(),
-                        machine: machine.clone(),
-                        request,
-                        egress: None,
-                        host_ports,
-                    };
-                    if let Some(egress) = egress {
-                        if let Err(error) = egress.initialize_trust(&handle).await {
-                            self.delete_machine_if_present(&machine).await?;
-                            return Err(error);
-                        }
-                        handle.egress = Some(egress);
-                    }
-                    Ok(handle)
                 },
                 self.delete_machine_if_present(&machine),
             )
-            .await?;
+            .await;
+        if let Some(mounts) = restored_mounts {
+            if handle.is_ok() {
+                mounts.keep();
+            } else {
+                tokio::task::spawn_blocking(move || drop(mounts)).await?;
+            }
+        }
+        let handle = handle?;
         self.invalidate_tcp_forwards(&request.sandbox_id);
         Ok(crate::with_process_management(handle))
     }
@@ -1088,7 +1095,10 @@ impl ManagedSandboxHandle for SmolvmOneShotHandle {
 
 /// Persistent-machine handle: execs join a machine that stays booted.
 struct SmolvmWarmHandle {
+    #[cfg(unix)]
+    snapshot_lock: tokio::sync::Mutex<()>,
     snapshot_root: PathBuf,
+    filesystem_snapshots: bool,
     id: String,
     binary: PathBuf,
     machine: String,
@@ -1243,19 +1253,19 @@ impl ManagedSandboxHandle for SmolvmWarmHandle {
             self.request.lifecycle.idle_ttl.is_some(),
             "filesystem capture requires a managed lifecycle"
         );
-        let mut help = Command::new(&self.binary);
-        help.args(["pack", "create", "--help"]);
-        let help = run_checked(help, "smolvm pack capabilities").await?;
         ensure!(
-            help.contains("--include-workspace") && help.contains("--rebase-from-image"),
-            "complete filesystem capture requires smolvm 1.20.0 or newer"
+            self.filesystem_snapshots,
+            "complete filesystem capture requires smolvm {MIN_FILESYSTEM_SNAPSHOT_VERSION} or newer with --include-workspace"
         );
+        let _snapshot_guard = self.snapshot_lock.lock().await;
         let mut stop = Command::new(&self.binary);
         stop.args(["machine", "stop", "--name", &self.machine]);
         run_checked(stop, "smolvm machine stop").await?;
         let result = async {
             tokio::fs::create_dir_all(&self.snapshot_root).await?;
-            let staging = tempfile::tempdir_in(&self.snapshot_root)?;
+            let root = self.snapshot_root.clone();
+            let (staging, _staging_lease) =
+                tokio::task::spawn_blocking(move || filesystem::staging_directory(&root)).await??;
             let stub = staging.path().join("machine");
             let mut pack = Command::new(&self.binary);
             pack.args([
@@ -1570,6 +1580,7 @@ mod tests {
     use super::*;
     use crate::ResourceScope;
     use crate::sandbox::SandboxLifecycleConfig;
+    use MachineSource::Image;
 
     #[tokio::test]
     async fn published_tcp_ports_connect_and_reject_other_guest_ports() -> Result<()> {
@@ -1578,7 +1589,10 @@ mod tests {
         let mut request = test_request(Some(Duration::from_secs(60)));
         request.spec.tcp_ports = vec![20_000, 20_001];
         let handle = SmolvmWarmHandle {
+            #[cfg(unix)]
+            snapshot_lock: tokio::sync::Mutex::new(()),
             snapshot_root: snapshot_dir(),
+            filesystem_snapshots: false,
             id: "smolvm:test".into(),
             binary: PathBuf::from("smolvm"),
             machine: "test".into(),
@@ -1717,8 +1731,9 @@ mod tests {
         request.spec.tcp_ports = vec![20_000, 20_001];
         request.spec.resources = crate::SandboxResourceShape::new(4, 16384);
         let host_ports = backend
-            .ensure_machine_started("test", &request.spec, "test", "alpine", None)
-            .await?;
+            .ensure_machine_started("test", request.clone(), Image("alpine"), None)
+            .await?
+            .host_ports;
         let args = std::fs::read_to_string(&args_file)?;
         assert!(args.contains("--storage\n64\n"));
         assert!(args.contains("--overlay\n128\n"));
@@ -1781,14 +1796,15 @@ mod tests {
         request.spec.tcp_ports = vec![20_000, 20_001];
         assert_eq!(
             backend
-                .ensure_machine_started("test", &request.spec, "test", "alpine", None)
-                .await?,
+                .ensure_machine_started("test", request.clone(), Image("alpine"), None)
+                .await?
+                .host_ports,
             BTreeMap::from([(20_000, 43_210), (20_001, 43_211)])
         );
         request.spec.tcp_ports = vec![20_001];
         assert!(
             backend
-                .ensure_machine_started("test", &request.spec, "test", "alpine", None)
+                .ensure_machine_started("test", request.clone(), Image("alpine"), None)
                 .await
                 .is_err()
         );
@@ -1823,7 +1839,7 @@ mod tests {
             allowed_hosts: vec!["api.test".into()],
         };
         backend
-            .ensure_machine_started("test", &request.spec, "test", "alpine", None)
+            .ensure_machine_started("test", request.clone(), Image("alpine"), None)
             .await?;
         let args = std::fs::read_to_string(args_file)?;
         assert!(args.contains("--allow-host-pattern\napi.test\n"), "{args}");
@@ -1865,9 +1881,10 @@ mod tests {
             allowed_hosts: vec!["api.test".into()],
         };
         let error = backend
-            .ensure_machine_started("test", &request.spec, "test", "alpine", None)
+            .ensure_machine_started("test", request.clone(), Image("alpine"), None)
             .await
-            .unwrap_err()
+            .err()
+            .context("existing machine should reject the changed host policy")?
             .to_string();
         assert!(
             error.contains("older or different limited host policy"),
@@ -2045,7 +2062,7 @@ esac"#,
     }
 
     #[cfg(unix)]
-    fn write_test_binary(path: &Path, body: &str) {
+    pub(super) fn write_test_binary(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         crate::test_support::write_test_executable(path, &format!("#!/bin/sh\n{body}\n")).unwrap();
     }
@@ -2210,6 +2227,139 @@ esac"#,
         // gate requires and must not enable warm mode.
         assert!(!supports("smolvm 1.7.2-rc.1"));
         assert!(supports("smolvm 1.7.3-rc.1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_snapshots_serialize_stop_pack_publish_and_start() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let binary = root.path().join("smolvm");
+        write_test_binary(
+            &binary,
+            r#"
+root=$(dirname "$0")
+case "$1 $2" in
+  'machine stop') printf 'stop\n' >> "$root/events";;
+  'pack create')
+    mkdir "$root/packing" || exit 23
+    printf 'pack\n' >> "$root/events"
+    attempts=0
+    until [ -f "$root/release" ]; do
+      attempts=$((attempts + 1))
+      [ "$attempts" -lt 500 ] || exit 24
+      sleep 0.01
+    done
+    printf 'captured' > "$7.smolmachine"
+    rmdir "$root/packing";;
+  'machine start')
+    [ ! -d "$root/packing" ] || exit 25
+    printf 'start\n' >> "$root/events";;
+  *) exit 26;;
+esac"#,
+        );
+        let handle = Arc::new(SmolvmWarmHandle {
+            snapshot_lock: tokio::sync::Mutex::new(()),
+            snapshot_root: root.path().join("captures"),
+            filesystem_snapshots: true,
+            id: "smolvm:test".into(),
+            binary,
+            machine: "test".into(),
+            request: test_request(Some(Duration::from_secs(60))),
+            egress: None,
+            host_ports: BTreeMap::new(),
+        });
+        let first_handle = handle.clone();
+        let first =
+            tokio::spawn(
+                async move { first_handle.snapshot(crate::SnapshotKind::Filesystem).await },
+            );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.path().join("packing").is_dir() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let second =
+            tokio::spawn(async move { handle.snapshot(crate::SnapshotKind::Filesystem).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = std::fs::read_to_string(root.path().join("events"));
+        std::fs::write(root.path().join("release"), b"release")?;
+        let (first, second) = tokio::join!(first, second);
+        first??;
+        second??;
+        assert_eq!(events?, "stop\npack\n");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("events"))?,
+            "stop\npack\nstart\nstop\npack\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_all_owned_only_deletes_machines_in_its_namespace() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let binary = root.path().join("smolvm");
+        write_test_binary(
+            &binary,
+            r#"
+case "$1 $2" in
+  '--version ') printf 'smolvm 1.20.0\n';;
+  'machine ls') cat "$(dirname "$0")/machines.json";;
+  'machine delete') printf '%s\n' "$*" >> "$(dirname "$0")/deleted";;
+  *) exit 23;;
+esac"#,
+        );
+        let backend = SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
+            binary: Some(binary),
+            image_cache: Some(root.path().join("images")),
+            ..Default::default()
+        });
+        std::fs::write(
+            root.path().join("machines.json"),
+            serde_json::to_vec(&json!([
+                {"name": "owned-a", "labels": {"exo.state-root": backend.snapshot_root}},
+                {"name": "foreign", "labels": {"exo.state-root": "/other"}},
+                {"name": "owned-b", "labels": {"exo.state-root": backend.snapshot_root}},
+                {"name": "unlabeled"}
+            ]))?,
+        )?;
+        assert_eq!(backend.terminate_all_owned().await?, 2);
+        let deleted = std::fs::read_to_string(root.path().join("deleted"))?;
+        let mut deleted = deleted.lines().collect::<Vec<_>>();
+        deleted.sort_unstable();
+        assert_eq!(
+            deleted,
+            [
+                "machine delete --name owned-a --force",
+                "machine delete --name owned-b --force",
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_capability_is_cached_and_does_not_require_rebasing() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let binary = root.path().join("smolvm");
+        write_test_binary(
+            &binary,
+            r#"
+case "$1 $2" in
+  '--version ') printf 'smolvm 1.20.0\n';;
+  'pack create') printf x >> "$(dirname "$0")/pack-probes"; printf '%s\n' --include-workspace;;
+  *) exit 0;;
+esac"#,
+        );
+        let backend = SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
+            binary: Some(binary),
+            ..Default::default()
+        });
+        assert!(backend.capabilities().await?.filesystem_snapshots);
+        assert!(backend.capabilities().await?.filesystem_snapshots);
+        assert_eq!(std::fs::read(root.path().join("pack-probes"))?, b"x");
+        Ok(())
     }
 
     pub(super) fn test_request(idle_ttl: Option<Duration>) -> SandboxRequest {

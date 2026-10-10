@@ -55,9 +55,11 @@ use crate::{
     SandboxTerminalParts, SandboxTerminalSize,
 };
 
+use super::capture_store::{self, allocated_files as snapshot_directory_bytes};
 use super::firecracker_image::resolve_image;
 #[cfg(test)]
 use super::firecracker_image::validate_ext4_image;
+use super::snapshot_lease::SnapshotLease;
 
 #[cfg(target_os = "linux")]
 #[path = "firecracker_lima_storage.rs"]
@@ -651,6 +653,8 @@ impl Drop for MachineCapacityReservation {
     }
 }
 
+type ImageIdentity = (u64, u64, u64, i64, i64);
+
 struct Shared {
     config: FirecrackerConfig,
     host_fingerprint: FirecrackerHostFingerprint,
@@ -665,7 +669,7 @@ struct Shared {
     lifecycle_locks: MachineLifecycleLocks,
     capacity_gate: Mutex<()>,
     starting_machines: Arc<StdMutex<HashSet<String>>>,
-    base_image_digests: StdMutex<HashMap<(u64, u64, u64, i64, i64), String>>,
+    base_image_digests: StdMutex<HashMap<ImageIdentity, String>>,
 }
 
 impl Drop for Shared {
@@ -4754,34 +4758,19 @@ fn remove_directory_if_present(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_directory_bytes(directory: &Path, inodes: &mut HashSet<(u64, u64)>) -> Result<u64> {
-    let mut total = 0u64;
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        let bytes = if kind.is_dir() {
-            snapshot_directory_bytes(&entry.path(), inodes)?
-        } else if kind.is_file() {
-            let metadata = entry.metadata()?;
-            if inodes.insert((metadata.dev(), metadata.ino())) {
-                metadata
-                    .blocks()
-                    .checked_mul(512)
-                    .context("snapshot size overflow")?
-            } else {
-                0
-            }
-        } else {
-            bail!("unexpected file in Firecracker snapshot storage");
-        };
-        total = total.checked_add(bytes).context("snapshot size overflow")?;
-    }
-    Ok(total)
+fn snapshot_budget_lock(config: &FirecrackerConfig) -> Result<SnapshotLease> {
+    capture_store::budget_lock(&config.state_root.join("snapshot-budget.lock"))
 }
 
-fn enforce_snapshot_budget(config: &FirecrackerConfig) -> Result<()> {
-    let mut inodes = HashSet::new();
+fn retained_snapshot_bytes(config: &FirecrackerConfig) -> Result<u64> {
+    let mut inodes = filesystem::shared_base_image_inodes(config)?;
     let mut retained = snapshot_directory_bytes(&config.state_root.join("snapshots"), &mut inodes)?;
+    retained = retained
+        .checked_add(snapshot_directory_bytes(
+            &config.state_root.join("filesystem-snapshots"),
+            &mut inodes,
+        )?)
+        .context("snapshot size overflow")?;
     let machines = match fs::read_dir(jail_dir(config, "")) {
         Ok(machines) => Some(machines),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -4799,9 +4788,14 @@ fn enforce_snapshot_budget(config: &FirecrackerConfig) -> Result<()> {
                 .context("snapshot size overflow")?;
         }
     }
-    if retained > MAX_SNAPSHOT_BYTES {
-        bail!("Firecracker snapshot storage budget exhausted");
-    }
+    Ok(retained)
+}
+
+fn enforce_snapshot_budget(config: &FirecrackerConfig) -> Result<()> {
+    ensure!(
+        retained_snapshot_bytes(config)? <= MAX_SNAPSHOT_BYTES,
+        "Firecracker snapshot storage budget exhausted; delete unused snapshots"
+    );
     Ok(())
 }
 
@@ -4851,20 +4845,11 @@ fn seal_snapshot_files(directory: &Path, names: &[&str]) -> Result<()> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(false)
         .open(&lease)?;
     fs::set_permissions(lease, Permissions::from_mode(0o600))?;
     file.sync_all()?;
-    Ok(())
-}
-
-fn publish_snapshot_directory(temporary: &Path, destination: &Path) -> Result<()> {
-    File::open(temporary)?.sync_all()?;
-    fs::rename(temporary, destination)
-        .with_context(|| format!("publishing Firecracker snapshot {}", destination.display()))?;
-    let parent = destination.parent().context("missing snapshot parent")?;
-    File::open(parent)?.sync_all()?;
-    File::open(parent.parent().context("missing snapshot namespace")?)?.sync_all()?;
     Ok(())
 }
 
@@ -4905,7 +4890,10 @@ fn capture_snapshot_template(
         .and_then(|bytes| bytes.checked_mul(2))
         .and_then(|bytes| bytes.checked_add(disk_bytes))
         .context("computing Firecracker snapshot capture size")?;
-    enforce_snapshot_budget(config)?;
+    {
+        let _budget = snapshot_budget_lock(config)?;
+        enforce_snapshot_budget(config)?;
+    }
     let filesystem = rustix::fs::statvfs(&config.state_root)?;
     let available = filesystem.f_bavail.saturating_mul(filesystem.f_frsize);
     let reserve =
@@ -5018,7 +5006,6 @@ fn capture_snapshot_template(
             copy_sparse_reflink(&output.join(name), &temporary.join(name))?;
         }
         seal_snapshot_files(&temporary, &["state", "memory", "overlay.ext4"])?;
-        enforce_snapshot_budget(config)?;
         if lifecycle == SnapshotTemplateLifecycle::Machine {
             let marker = temporary.join(SNAPSHOT_FORK_TEMPLATE_FILE);
             File::create(&marker)?.sync_all()?;
@@ -5038,6 +5025,14 @@ fn capture_snapshot_template(
         (Ok(()), Err(error)) => Err(error).context("cleaning up Firecracker snapshot jail output"),
         (Ok(()), Ok(())) => Ok(()),
     };
+    let result = result.and_then(|()| {
+        capture_store::publish(
+            &temporary,
+            &destination,
+            &config.state_root.join("snapshot-budget.lock"),
+            || enforce_snapshot_budget(config),
+        )
+    });
     if let Err(error) = result {
         if let Err(cleanup_error) = remove_directory_if_present(&temporary) {
             return Err(error).context(format!(
@@ -5046,7 +5041,6 @@ fn capture_snapshot_template(
         }
         return Err(error);
     }
-    publish_snapshot_directory(&temporary, &destination)?;
     validate_snapshot_template(config, &destination, source.runtime.memory_mib)?;
     replace_hard_link(&destination.join("memory"), &memory_base)?;
     fs::remove_file(&capture_pending)?;

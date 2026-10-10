@@ -11,7 +11,11 @@ pub fn default_firecracker_image() -> String {
     DEFAULT_FIRECRACKER_IMAGE.to_string()
 }
 
+#[cfg(all(unix, any(feature = "basic-backend", feature = "firecracker")))]
+mod capture_store;
 mod docker;
+#[cfg(all(unix, any(feature = "basic-backend", feature = "firecracker")))]
+mod snapshot_lease;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod daytona;

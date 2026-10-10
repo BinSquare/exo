@@ -604,9 +604,10 @@ impl ChatRepl {
                 anyhow::anyhow!("no sandbox has been created in this conversation yet")
             })?;
         println!("snapshotting sandbox {sandbox_id}...");
+        let kind = teleport_snapshot_kind(self.conversation.as_ref(), &sandbox_id).await?;
         let snapshot_id = self
             .conversation
-            .snapshot_sandbox(sandbox_id.clone(), exoharness::SnapshotKind::Filesystem)
+            .snapshot_sandbox(sandbox_id.clone(), kind)
             .await?;
         println!("snapshot {snapshot_id} captured; restoring on {provider}...");
         self.conversation
@@ -962,7 +963,9 @@ fn print_help() {
     println!("  /verbosity <level>   set tool output detail: minimal, compact, or full");
     println!("  /cost | /usage       summarize token usage and dollar cost");
     println!("  /snapshot <filesystem|full> [<id>]  capture the requested sandbox state");
-    println!("                       (defaults to the latest one if no id is given)");
+    println!(
+        "                                      (defaults to the latest one if no id is given)"
+    );
     println!("  /snapshots           list snapshots taken in this conversation");
     println!("  /rewind <id>         restore the sandbox to a previous snapshot");
     println!("  /teleport <provider> move the live sandbox to another provider");
@@ -1094,6 +1097,23 @@ pub(crate) async fn teleport_lines(
     }
 }
 
+async fn teleport_snapshot_kind(
+    conversation: &dyn ConversationHandle,
+    sandbox_id: &SandboxId,
+) -> Result<exoharness::SnapshotKind> {
+    let source = conversation
+        .list_sandboxes()
+        .await?
+        .into_iter()
+        .find(|sandbox| &sandbox.id == sandbox_id)
+        .ok_or_else(|| anyhow::anyhow!("sandbox {sandbox_id} not found"))?;
+    Ok(if source.provider == SandboxProvider::E2b {
+        exoharness::SnapshotKind::Full
+    } else {
+        exoharness::SnapshotKind::Filesystem
+    })
+}
+
 async fn teleport_sandbox(
     conversation: &dyn ConversationHandle,
     provider_str: &str,
@@ -1104,8 +1124,9 @@ async fn teleport_sandbox(
     let sandbox_id = latest_sandbox_id(conversation)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no sandbox has been created in this conversation yet"))?;
+    let kind = teleport_snapshot_kind(conversation, &sandbox_id).await?;
     let snapshot_id = conversation
-        .snapshot_sandbox(sandbox_id.clone(), exoharness::SnapshotKind::Filesystem)
+        .snapshot_sandbox(sandbox_id.clone(), kind)
         .await?;
     conversation
         .start_sandbox(StartSandboxRequest {

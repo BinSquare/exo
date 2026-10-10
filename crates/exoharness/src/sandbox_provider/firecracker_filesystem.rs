@@ -1,5 +1,11 @@
 use super::*;
 
+const MAX_CAPTURE_MOUNTS: usize = 20;
+
+fn new_capture_key() -> String {
+    format!("{:x}", Sha256::digest(Uuid::new_v4().as_bytes()))
+}
+
 fn validate_capture_runtime(version: &str) -> Result<()> {
     let version = semver::Version::parse(version.trim_start_matches('v'))?;
     ensure!(
@@ -82,7 +88,7 @@ impl FilesystemLayout {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct FilesystemManifest {
     template: bool,
     version: u32,
@@ -99,22 +105,25 @@ impl FilesystemManifest {
             payload.format == SnapshotFormat::FirecrackerFilesystemRef,
             "not a Firecracker filesystem snapshot"
         );
-        let manifest: Self = serde_json::from_slice(&payload.bytes)?;
+        serde_json::from_slice::<Self>(&payload.bytes)?.validate()
+    }
+
+    fn validate(self) -> Result<Self> {
         ensure!(
-            manifest.version == 1,
+            self.version == 1,
             "unsupported Firecracker filesystem snapshot version"
         );
-        validate_snapshot_key(&manifest.key)?;
-        validate_snapshot_key(&manifest.base_image_sha256)?;
+        validate_snapshot_key(&self.key)?;
+        validate_snapshot_key(&self.base_image_sha256)?;
         ensure!(
-            manifest.disk_sizes.len() == manifest.layout.disk_names().len(),
+            self.disk_sizes.len() == self.layout.disk_names().len(),
             "filesystem snapshot disk set is incomplete"
         );
         ensure!(
-            manifest.layout.workspaces.len() <= 1 && manifest.layout.mounts.len() <= 20,
+            self.layout.workspaces.len() <= 1 && self.layout.mounts.len() <= MAX_CAPTURE_MOUNTS,
             "invalid filesystem snapshot disk layout"
         );
-        Ok(manifest)
+        Ok(self)
     }
 
     fn payload(&self) -> Result<SnapshotPayload> {
@@ -132,15 +141,17 @@ impl FilesystemManifest {
             .join(&self.key)
     }
 
-    fn staging_directory(&self, config: &FirecrackerConfig) -> Result<tempfile::TempDir> {
+    fn staging_directory(
+        &self,
+        config: &FirecrackerConfig,
+    ) -> Result<(tempfile::TempDir, SnapshotLease)> {
         let destination = self.directory(config);
-        let parent = destination
-            .parent()
-            .context("missing filesystem snapshot parent")?;
-        fs::create_dir_all(parent)?;
-        Ok(tempfile::Builder::new()
-            .prefix(".capture-")
-            .tempdir_in(parent)?)
+        capture_store::staging_directory(
+            destination
+                .parent()
+                .context("missing filesystem snapshot parent")?,
+            &config.state_root.join("snapshot-budget.lock"),
+        )
     }
 }
 
@@ -149,15 +160,7 @@ pub struct FirecrackerFilesystemCapture {
     pub payload: SnapshotPayload,
     pub base_image: PathBuf,
     pub disks: Vec<PathBuf>,
-    _lease: File,
-}
-
-impl Drop for FirecrackerFilesystemCapture {
-    fn drop(&mut self) {
-        if let Err(error) = flock(&self._lease, FlockOperation::Unlock) {
-            tracing::warn!(%error, "failed to release filesystem capture lease");
-        }
-    }
+    _lease: SnapshotLease,
 }
 
 fn open_capture(
@@ -166,13 +169,10 @@ fn open_capture(
 ) -> Result<FirecrackerFilesystemCapture> {
     let manifest = FilesystemManifest::from_payload(&payload)?;
     let directory = manifest.directory(config);
-    let lease = File::open(directory.join("lease"))
-        .context("Firecracker filesystem snapshot is missing on this host")?;
-    flock(&lease, FlockOperation::LockShared)?;
-    let stored: FilesystemManifest =
-        serde_json::from_reader(File::open(directory.join("manifest.json"))?.take(1_048_576))?;
+    let lease = capture_store::read_lease(&directory)?;
+    let stored: FilesystemManifest = capture_store::read_manifest(&directory)?;
     ensure!(
-        stored.payload()?.bytes == payload.bytes,
+        stored == manifest,
         "filesystem snapshot manifest does not match its reference"
     );
     let disks: Vec<_> = manifest
@@ -204,26 +204,11 @@ fn open_capture(
     })
 }
 
-fn allocated_bytes(directory: &Path) -> Result<u64> {
-    snapshot_directory_bytes(directory, &mut HashSet::new())
-}
-
 fn publish_capture(
     config: &FirecrackerConfig,
     temporary: &Path,
     manifest: &FilesystemManifest,
 ) -> Result<()> {
-    let budget_lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(config.state_root.join("filesystem-snapshot.lock"))?;
-    budget_lock.lock()?;
-    ensure!(
-        allocated_bytes(&config.state_root.join("filesystem-snapshots"))? <= MAX_SNAPSHOT_BYTES,
-        "Firecracker filesystem snapshot budget exhausted; delete unused snapshots"
-    );
     fs::write(
         temporary.join("manifest.json"),
         serde_json::to_vec(manifest)?,
@@ -232,8 +217,12 @@ fn publish_capture(
     names.extend(["base.ext4".to_owned(), "manifest.json".to_owned()]);
     let names: Vec<_> = names.iter().map(String::as_str).collect();
     seal_snapshot_files(temporary, &names)?;
-    publish_snapshot_directory(temporary, &manifest.directory(config))?;
-    Ok(())
+    capture_store::publish(
+        temporary,
+        &manifest.directory(config),
+        &config.state_root.join("snapshot-budget.lock"),
+        || enforce_snapshot_budget(config),
+    )
 }
 
 fn capture_disks(
@@ -242,9 +231,13 @@ fn capture_disks(
     mut manifest: FilesystemManifest,
     suspend: bool,
 ) -> Result<SnapshotPayload> {
-    let temporary = manifest.staging_directory(config)?;
+    let (temporary, _staging_lease) = manifest.staging_directory(config)?;
     let root = jail_root(config, &source.machine_id);
     fs::hard_link(root.join("rootfs.ext4"), temporary.path().join("base.ext4"))?;
+    {
+        let _budget = snapshot_budget_lock(config)?;
+        enforce_snapshot_budget(config)?;
+    }
     with_paused_snapshot_source(&root, &source.machine_id, suspend, || {
         for name in manifest.layout.disk_names() {
             copy_sparse_reflink(&root.join(&name), &temporary.path().join(&name))
@@ -253,33 +246,24 @@ fn capture_disks(
                 .disk_sizes
                 .push(fs::metadata(temporary.path().join(name))?.len());
         }
-        publish_capture(config, temporary.path(), &manifest)?;
+        if suspend {
+            publish_capture(config, temporary.path(), &manifest)?;
+        }
         Ok(())
     })?;
+    if !suspend {
+        publish_capture(config, temporary.path(), &manifest)?;
+    }
     manifest.payload()
 }
 
 pub(super) fn delete_capture(config: &FirecrackerConfig, payload: SnapshotPayload) -> Result<()> {
-    let manifest = FilesystemManifest::from_payload(&payload)?;
-    let directory = manifest.directory(config);
-    if !directory.try_exists()? {
-        return Ok(());
-    }
-    let lease = File::open(directory.join("lease"))?;
-    flock(&lease, FlockOperation::NonBlockingLockExclusive)
-        .context("filesystem snapshot is still in use")?;
-    fs::remove_dir_all(&directory)?;
-    File::open(
-        directory
-            .parent()
-            .context("missing filesystem snapshot parent")?,
-    )?
-    .sync_all()?;
-    Ok(())
+    capture_store::delete(&FilesystemManifest::from_payload(&payload)?.directory(config))
 }
 
 impl FirecrackerSandboxBackend {
     /// Opens the immutable files referenced by a filesystem snapshot for upload.
+    /// Used by the hosted sandbox service for durable checkpoint uploads.
     pub async fn filesystem_snapshot_files(
         &self,
         payload: SnapshotPayload,
@@ -289,6 +273,7 @@ impl FirecrackerSandboxBackend {
     }
 
     /// Imports verified, stable disk files, in capture order, onto this worker's XFS.
+    /// Used by the hosted sandbox service for durable checkpoint recovery.
     pub async fn import_filesystem_snapshot(
         &self,
         payload: SnapshotPayload,
@@ -307,8 +292,8 @@ impl FirecrackerSandboxBackend {
                     == manifest.base_image_sha256,
                 "filesystem import base image does not match"
             );
-            manifest.key = format!("{:x}", Sha256::digest(Uuid::new_v4().as_bytes()));
-            let temporary = manifest.staging_directory(&config)?;
+            manifest.key = new_capture_key();
+            let (temporary, _staging_lease) = manifest.staging_directory(&config)?;
             copy_sparse_reflink(&base_image, &temporary.path().join("base.ext4"))?;
             for ((name, source), size) in manifest
                 .layout
@@ -329,6 +314,7 @@ impl FirecrackerSandboxBackend {
         .await?
     }
 
+    /// Used by the hosted sandbox service for local checkpoint garbage collection.
     pub async fn collect_filesystem_snapshots(&self, keep: Vec<SnapshotPayload>) -> Result<usize> {
         let config = self.shared.config.clone();
         tokio::task::spawn_blocking(move || collect_captures(&config, keep)).await?
@@ -452,24 +438,27 @@ impl FirecrackerSandboxBackend {
             Ok(handle)
         }
         .await;
-        if let Err(error) = result {
-            let _guard = match lifecycle_guard {
-                Some(guard) => guard,
-                None => self.shared.lifecycle_locks.lock_machine(&id).await,
-            };
-            self.shared
-                .warm_machines
-                .lock()
-                .await
-                .retain(|_, entry| entry.machine_id != id);
-            return match self.shared.cleanup_machine(&id, true).await {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("filesystem restore cleanup failed: {cleanup:#}")))
+        match result {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                let _guard = match lifecycle_guard {
+                    Some(guard) => guard,
+                    None => self.shared.lifecycle_locks.lock_machine(&id).await,
+                };
+                self.shared
+                    .warm_machines
+                    .lock()
+                    .await
+                    .retain(|_, entry| entry.machine_id != id);
+                match self.shared.cleanup_machine(&id, true).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => {
+                        Err(error
+                            .context(format!("filesystem restore cleanup failed: {cleanup:#}")))
+                    }
                 }
-            };
+            }
         }
-        result
     }
 }
 
@@ -480,7 +469,7 @@ pub(super) async fn snapshot_filesystem(
     template: bool,
 ) -> Result<SnapshotPayload> {
     tokio::spawn(async move {
-        let guard = shared
+        let _guard = shared
             .lifecycle_locks
             .lock_sandbox(&request.sandbox_id)
             .await;
@@ -537,18 +526,18 @@ pub(super) async fn snapshot_filesystem(
             );
             for path in layout.sync_paths() {
                 guest
-                    .sync_filesystem(&path)
+                    .sync_filesystem(path)
                     .await
                     .context("syncing filesystem capture source")?;
             }
         }
         let capture_shared = Arc::clone(&shared);
         let source_for_capture = source.clone();
-        let (payload, _guard) = tokio::task::spawn_blocking(move || {
+        let payload = tokio::task::spawn_blocking(move || {
             let manifest = FilesystemManifest {
                 template,
                 version: 1,
-                key: format!("{:x}", Sha256::digest(Uuid::new_v4().as_bytes())),
+                key: new_capture_key(),
                 sandbox_id: request.sandbox_id,
                 base_image_sha256: capture_shared.base_image_digest(
                     &jail_root(&capture_shared.config, &source_for_capture.machine_id)
@@ -557,13 +546,12 @@ pub(super) async fn snapshot_filesystem(
                 layout,
                 disk_sizes: Vec::new(),
             };
-            let payload = capture_disks(
+            capture_disks(
                 &capture_shared.config,
                 &source_for_capture,
                 manifest,
                 suspend,
-            )?;
-            Ok::<_, anyhow::Error>((payload, guard))
+            )
         })
         .await??;
         if suspend {
@@ -579,40 +567,45 @@ pub(super) async fn snapshot_filesystem(
     .await?
 }
 
+pub(super) fn shared_base_image_inodes(config: &FirecrackerConfig) -> Result<HashSet<(u64, u64)>> {
+    let root = config.state_root.join("filesystem-snapshots");
+    let mut bases = HashMap::new();
+    for sandbox in capture_store::directories(&root)? {
+        for capture in capture_store::directories(&sandbox?)? {
+            let metadata = match fs::symlink_metadata(capture?.join("base.ext4")) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let entry = bases
+                .entry((metadata.dev(), metadata.ino()))
+                .or_insert((metadata.nlink(), 0u64));
+            entry.1 += 1;
+        }
+    }
+    Ok(bases
+        .into_iter()
+        .filter_map(|(inode, (links, captures))| (links > captures).then_some(inode))
+        .collect())
+}
+
 fn collect_captures(config: &FirecrackerConfig, keep: Vec<SnapshotPayload>) -> Result<usize> {
     let keep = keep
         .iter()
-        .map(FilesystemManifest::from_payload)
-        .collect::<Result<Vec<_>>>()?
-        .iter()
-        .map(|manifest| manifest.key.clone())
-        .collect::<HashSet<_>>();
+        .map(|payload| Ok(FilesystemManifest::from_payload(payload)?.directory(config)))
+        .collect::<Result<_>>()?;
     let root = config.state_root.join("filesystem-snapshots");
-    if !root.exists() {
+    if !root.try_exists()? {
         return Ok(0);
     }
+    let _budget = snapshot_budget_lock(config)?;
     let mut removed = 0;
-    for sandbox in fs::read_dir(root)? {
-        let sandbox = sandbox?;
-        if !sandbox.file_type()?.is_dir() {
-            continue;
-        }
-        for capture in fs::read_dir(sandbox.path())? {
-            let capture = capture?;
-            if !capture.file_type()?.is_dir() {
-                continue;
-            }
-            let path = capture.path().join("manifest.json");
-            if !path.is_file() {
-                continue;
-            }
-            let manifest: FilesystemManifest =
-                serde_json::from_reader(File::open(path)?.take(1_048_576))?;
-            if !keep.contains(&manifest.key) {
-                delete_capture(&config, manifest.payload()?)?;
-                removed += 1;
-            }
-        }
+    for sandbox in capture_store::directories(&root)? {
+        removed += capture_store::collect(&sandbox?, &keep, |directory| {
+            let manifest: FilesystemManifest = capture_store::read_manifest(directory)?;
+            Ok(manifest.validate()?.directory(config))
+        })?;
     }
     Ok(removed)
 }
@@ -651,8 +644,7 @@ fn install_disks(
             .read(true)
             .write(true)
             .open(target.with_extension("lock"))?;
-        lock.lock()?;
-        locks.push(lock);
+        locks.push(SnapshotLease::exclusive(lock)?);
     }
     for target in &targets {
         if target.try_exists()? {
