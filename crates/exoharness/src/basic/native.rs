@@ -1248,7 +1248,15 @@ impl BasicConversationHandle {
         if resources.is_empty() {
             return Ok(Vec::new());
         }
-        let store = self.harness.inner.native.resources.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let store = self
+            .harness
+            .inner
+            .native
+            .resources
+            .clone()
+            .with_cancellation(cancel);
         let agent = self.agent_id;
         let thread = self.record.id;
         let resources_guard = self

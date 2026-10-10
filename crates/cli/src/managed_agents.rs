@@ -289,19 +289,26 @@ pub async fn open_thread(
     {
         println!("mcp: {count} tools");
     }
-    let config = runtime.get_agent_config(agent.as_ref()).await?;
+    progress.set_status(Some("Checking model credentials".into()));
+    let config = progress
+        .wait(runtime.get_agent_config(agent.as_ref()))
+        .await?;
     if let Some(name) = config.credential.as_deref() {
-        let reference = exoharness::vault::find_secret(opened.thread.as_ref(), name)
+        let reference = progress.wait(exoharness::vault::find_secret(opened.thread.as_ref(), name))
                 .await?
                 .with_context(|| {
                     format!(
                         "model credential {name:?} was not found in this thread's vaults; add it to the global vault or attach a vault containing it with --vault"
                     )
                 })?;
-        let vault =
-            exoharness::vault::require_vault(opened.thread.as_ref(), &reference.vault_id).await?;
-        let secret = vault
-            .list_secrets()
+        let vault = progress
+            .wait(exoharness::vault::require_vault(
+                opened.thread.as_ref(),
+                &reference.vault_id,
+            ))
+            .await?;
+        let secret = progress
+            .wait(vault.list_secrets())
             .await?
             .into_iter()
             .find(|secret| secret.id == reference.secret_id)

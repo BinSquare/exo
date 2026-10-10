@@ -1119,12 +1119,15 @@ async fn run_selected(
                 execution.egress_policy.is_some(),
             )
             .await?;
+            let mut progress = turn_display::TurnProgress::new();
+            progress.set_status(Some("Preparing session".into()));
             if local {
-                harness.start_inline_previews(agent.as_ref(), conversation.clone()).await?;
+                progress.wait(harness.start_inline_previews(agent.as_ref(), conversation.clone())).await?;
             }
-            if let Some(previews) = harness.preview_urls(agent.as_ref(), conversation.clone()).await? {
+            if let Some(previews) = progress.wait(harness.preview_urls(agent.as_ref(), conversation.clone())).await? {
                 previews::print_startup(&previews);
             }
+            drop(progress);
             if let Some(provider) = &selected_provider {
                 provider_store.pin_thread(
                     conversation.record().slug.clone(),

@@ -133,10 +133,16 @@ async fn discover(
 ) -> Result<Secret> {
     CredentialDestination::url(resource)?;
     let mut manager = AuthorizationManager::new(resource).await?;
-    let challenge = exo_mcp::probe_auth_challenge(resource).await?;
-    let resolution = manager
-        .resolve_metadata_from_challenge(challenge.as_deref())
-        .await?;
+    // Standard discovery also handles servers whose 401 omits WWW-Authenticate.
+    let resolution = manager.resolve_metadata().await?;
+    let resolution = if resolution.source.is_discovered() {
+        resolution
+    } else {
+        let challenge = exo_mcp::probe_auth_challenge(resource).await?;
+        manager
+            .resolve_metadata_from_challenge(challenge.as_deref())
+            .await?
+    };
     ensure!(
         resolution.source.is_discovered(),
         "resource does not advertise OAuth; import a token with `exo vault secret create --token-env`"
