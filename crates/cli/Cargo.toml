@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
+contract-tests = ["executor/contract-tests"]
 default = ["smolvm"]
 smolvm = ["executor/smolvm"]
 aws-agentcore = ["executor/aws-agentcore"]
@@ -14,6 +15,11 @@ firecracker = ["executor/firecracker"]
 [[bin]]
 name = "exo"
 path = "src/main.rs"
+
+[[bin]]
+name = "exo-provider-contract"
+path = "src/bin/provider_contract.rs"
+required-features = ["contract-tests"]
 
 [dependencies]
 tempfile = "3.23.0"

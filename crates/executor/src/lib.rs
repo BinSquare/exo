@@ -4,6 +4,8 @@ mod native;
 pub use native::*;
 
 mod basic;
+#[cfg(any(test, feature = "contract-tests"))]
+pub mod contract_tests;
 pub mod conversation_sandbox;
 pub mod execution_tracing;
 mod executor_types;
