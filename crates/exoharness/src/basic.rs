@@ -593,6 +593,9 @@ impl ExoHarness for BasicExoHarness {
             if !prepare_sandbox_scopes_for_deletion(self, &scopes).await? {
                 continue;
             }
+            for scope in &scopes {
+                delete_owned_snapshots(self, &scope.owner_dir).await?;
+            }
             #[cfg(feature = "basic-backend")]
             for conversation_id in agent_conversation_ids(self, &agent_dir).await? {
                 remove_thread_resources(self, *id, conversation_id).await?;
@@ -1186,6 +1189,7 @@ impl AgentHandle for BasicAgentHandle {
             {
                 continue;
             }
+            delete_owned_snapshots(&self.harness, &conversation_dir).await?;
             if let Ok(mut record) =
                 load_conversation_record(&self.harness.inner.storage, &conversation_dir).await
             {

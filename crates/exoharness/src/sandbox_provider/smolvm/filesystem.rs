@@ -1,4 +1,4 @@
-use super::super::capture_store::{self, allocated};
+use super::super::capture_store;
 use super::super::snapshot_lease::SnapshotLease;
 use super::*;
 use std::fs::{self, File};
@@ -25,7 +25,7 @@ struct Volume {
 impl Manifest {
     pub(super) fn parse(payload: &SnapshotPayload) -> Result<Self> {
         ensure!(
-            payload.format == SnapshotFormat::SmolvmMachinePack,
+            payload.format == SnapshotFormat::SmolvmFilesystemRef,
             "not a smolvm filesystem capture"
         );
         ensure!(
@@ -98,9 +98,12 @@ fn volume_root(path: &Path) -> Option<&Path> {
     (path.ends_with("mount/workspace") && root.join("volume.sparseimage").is_file()).then_some(root)
 }
 
-fn enforce_budget(root: &Path) -> Result<()> {
+fn enforce_budget(root: &Path, pending: u64) -> Result<()> {
     ensure!(
-        allocated(root)? <= MAX_ALLOCATED,
+        capture_store::retained_allocation(root)?
+            .checked_add(pending)
+            .context("snapshot size overflow")?
+            <= MAX_ALLOCATED,
         "retained filesystem capture budget exhausted"
     );
     Ok(())
@@ -143,14 +146,15 @@ pub(super) fn publish(
     serde_json::to_writer(&mut file, &manifest)?;
     drop(file);
     capture_store::sync_tree(staging.path())?;
+    let allocation = capture_store::record_allocation(staging.path())?;
     capture_store::publish(
         staging.path(),
         &root.join(&manifest.key),
         &root.join("budget.lock"),
-        || enforce_budget(root),
+        || enforce_budget(root, allocation),
     )?;
     Ok(SnapshotPayload {
-        format: SnapshotFormat::SmolvmMachinePack,
+        format: SnapshotFormat::SmolvmFilesystemRef,
         bytes: serde_json::to_vec(&manifest)?.into(),
     })
 }
@@ -472,6 +476,96 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cancelled_restore_keeps_mounts_and_leases_until_start_finishes() -> Result<()> {
+        for succeeds in [true, false] {
+            let root = tempfile::tempdir()?;
+            let binary = root.path().join("smolvm");
+            super::super::tests::write_test_binary(
+                &binary,
+                &format!(
+                    r#"
+root=$(dirname "$0")
+case "$1 $2" in
+  '--version ') printf 'smolvm 1.20.0\n';;
+  'machine status') printf 'machine not found\n' >&2; exit 1;;
+  'machine start')
+    touch "$root/starting"
+    attempts=0
+    until [ -f "$root/release" ]; do
+      attempts=$((attempts + 1))
+      [ "$attempts" -lt 500 ] || exit 24
+      sleep 0.01
+    done
+    [ "{succeeds}" = true ] || {{ printf 'start failure\n' >&2; exit 23; }};;
+  *) exit 0;;
+esac"#
+                ),
+            );
+            let backend = SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
+                binary: Some(binary),
+                mode: SmolvmExecutionMode::Warm,
+                snapshot_root: Some(root.path().join("captures")),
+                ..Default::default()
+            });
+            let source = root.path().join("source");
+            fs::create_dir(&source)?;
+            fs::write(source.join("marker"), b"captured")?;
+            let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
+            request.spec.mounts = vec![crate::SandboxMount {
+                host_path: source,
+                guest_path: "/repo".into(),
+                access: SandboxMountAccess::ReadWrite,
+                internal: false,
+            }];
+            let (staging, staging_lease) = staging_directory(&backend.snapshot_root)?;
+            fs::write(staging.path().join("machine.smolmachine"), b"pack")?;
+            let payload = publish(&backend.snapshot_root, staging, &request)?;
+            drop(staging_lease);
+            let target = root.path().join("target");
+            fs::create_dir(&target)?;
+            fs::write(target.join("existing"), b"previous")?;
+            request.spec.mounts[0].host_path = target.clone();
+            let restoring = {
+                let backend = backend.clone();
+                let request = request.clone();
+                let payload = payload.clone();
+                tokio::spawn(async move { backend.acquire_from_snapshot(request, payload).await })
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !root.path().join("starting").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            restoring.abort();
+            assert!(
+                restoring
+                    .await
+                    .err()
+                    .context("caller should be cancelled")?
+                    .is_cancelled()
+            );
+            assert_eq!(fs::read(target.join("marker"))?, b"captured");
+            assert!(backend.delete_snapshot(payload.clone()).await.is_err());
+            let stopping = {
+                let backend = backend.clone();
+                let request = request.clone();
+                tokio::spawn(async move { backend.stop(request).await })
+            };
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let waiting = !stopping.is_finished();
+            fs::write(root.path().join("release"), b"resume")?;
+            tokio::time::timeout(Duration::from_secs(5), stopping).await???;
+            assert!(waiting, "restore released its machine lock during start");
+            assert_eq!(target.join("marker").exists(), succeeds);
+            assert_eq!(target.join("existing").exists(), !succeeds);
+            backend.delete_snapshot(payload).await?;
+        }
+        Ok(())
+    }
+
     fn capture_fixture(root: &Path) -> Result<SnapshotPayload> {
         let request = super::super::tests::test_request(Some(Duration::from_secs(60)));
         let (staging, _lease) = staging_directory(root)?;
@@ -480,6 +574,24 @@ mod tests {
             b"unit-test pack",
         )?;
         publish(root, staging, &request)
+    }
+
+    #[test]
+    fn cached_allocations_enforce_the_budget_and_deletion_frees_it() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let payload = capture_fixture(root.path())?;
+        let directory = root.path().join(Manifest::parse(&payload)?.key);
+        assert_eq!(
+            capture_store::retained_allocation(root.path())?,
+            capture_store::allocated(&directory)?
+        );
+        fs::write(directory.join("allocated.bin"), MAX_ALLOCATED.to_le_bytes())?;
+        let error = capture_fixture(root.path()).unwrap_err();
+        assert!(error.to_string().contains("budget exhausted"));
+        delete(root.path(), &payload)?;
+        assert_eq!(capture_store::retained_allocation(root.path())?, 0);
+        capture_fixture(root.path())?;
+        Ok(())
     }
 
     #[tokio::test]

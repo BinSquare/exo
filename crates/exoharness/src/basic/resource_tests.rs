@@ -19,6 +19,8 @@ struct ResourceBackend {
     entered: mpsc::UnboundedSender<(ConversationId, bool)>,
     release: Semaphore,
     materialized: Mutex<HashSet<ConversationId>>,
+    deleted_snapshots: Mutex<Vec<bytes::Bytes>>,
+    fail_snapshot_deletion: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -46,8 +48,23 @@ impl ManagedSandboxBackend for ResourceBackend {
         &[]
     }
 
+    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
+        if self
+            .fail_snapshot_deletion
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            bail!("capture is busy");
+        }
+        self.deleted_snapshots.lock().unwrap().push(payload.bytes);
+        Ok(())
+    }
+
     async fn acquire(&self, _request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        bail!("resource test does not start VMs")
+        Ok(Arc::new(CaptureHandle))
+    }
+
+    async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
+        Ok(())
     }
 
     async fn attach(
@@ -64,6 +81,38 @@ impl ManagedSandboxBackend for ResourceBackend {
         _payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("resource test does not restore VMs")
+    }
+}
+
+struct CaptureHandle;
+
+#[async_trait]
+impl ManagedSandboxHandle for CaptureHandle {
+    fn id(&self) -> &str {
+        "capture-test"
+    }
+
+    async fn exec(&self, _command: &crate::SandboxCommand) -> Result<crate::SandboxCommandOutput> {
+        bail!("capture test does not execute commands")
+    }
+
+    async fn start_process(&self, _command: &crate::SandboxCommand) -> Result<SandboxProcessParts> {
+        bail!("capture test does not start processes")
+    }
+
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        bail!("capture test does not attach VMs")
+    }
+
+    async fn snapshot(&self, _kind: crate::SnapshotKind) -> Result<SnapshotPayload> {
+        Ok(SnapshotPayload {
+            format: SnapshotFormat::FirecrackerFilesystemRef,
+            bytes: bytes::Bytes::from_static(b"capture"),
+        })
     }
 }
 
@@ -90,6 +139,8 @@ impl Fixture {
             entered,
             release: Semaphore::new(0),
             materialized: Mutex::new(HashSet::new()),
+            deleted_snapshots: Mutex::new(Vec::new()),
+            fail_snapshot_deletion: std::sync::atomic::AtomicBool::new(false),
         });
         let mut config = local_test_config(directory.path());
         config
@@ -117,6 +168,24 @@ impl Fixture {
 
     async fn thread(&self) -> Result<Arc<dyn ConversationHandle>> {
         timeout(DEADLINE, self.agent.new_conversation(Default::default())).await?
+    }
+
+    async fn sandbox(&self) -> Result<SandboxId> {
+        self.agent
+            .create_sandbox(CreateSandboxRequest {
+                name: None,
+                provider: SandboxProvider::Firecracker,
+                image: "test".into(),
+                resources: None,
+                default_workdir: None,
+                file_system_mounts: None,
+                durable_file_systems: None,
+                policy: None,
+                enable_networking: None,
+                idle_seconds: None,
+                tcp_ports: Vec::new(),
+            })
+            .await
     }
 
     fn resources(&self) -> Vec<PreparedResource> {
@@ -336,5 +405,259 @@ async fn environment_changes_and_forks_wait_for_resource_preparation() -> Result
     timeout(DEADLINE, preparation).await???;
     assert!(timeout(DEADLINE, update).await??.is_err());
     assert!(timeout(DEADLINE, fork).await??.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_deletion_releases_snapshots_and_preserves_references_on_failure() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let first = fixture.thread().await?;
+    let second = fixture.thread().await?;
+    let mut snapshot_paths = Vec::new();
+    for (owner, contents) in [
+        (
+            ResourceScope::Agent {
+                agent_id: fixture.agent.record().id,
+            },
+            b"agent".as_slice(),
+        ),
+        (
+            ResourceScope::Thread {
+                agent_id: fixture.agent.record().id,
+                thread_id: first.record().id,
+            },
+            b"first".as_slice(),
+        ),
+        (
+            ResourceScope::Thread {
+                agent_id: fixture.agent.record().id,
+                thread_id: second.record().id,
+            },
+            b"second".as_slice(),
+        ),
+    ] {
+        let snapshot_id = Uuid7::now();
+        let directory = fixture
+            .harness
+            .owner_dir(owner)
+            .join("snapshots")
+            .join(snapshot_id.to_string());
+        fixture
+            .harness
+            .inner
+            .storage
+            .put_json(
+                directory.join("manifest.json"),
+                &StoredSnapshotManifest {
+                    snapshot_id,
+                    sandbox_id: "previously-terminated".into(),
+                    format: crate::sandbox::SnapshotFormat::FirecrackerFilesystemRef,
+                    provider: Some(SandboxProvider::Firecracker),
+                    created_at: chrono::Utc::now(),
+                    payload_size_bytes: contents.len() as u64,
+                    payload: None,
+                },
+            )
+            .await?;
+        fixture
+            .harness
+            .inner
+            .storage
+            .put_bytes(directory.join("payload.bin"), contents.to_vec())
+            .await?;
+        snapshot_paths.push(directory.join("payload.bin"));
+        let incomplete_id = Uuid7::now();
+        fixture
+            .harness
+            .inner
+            .storage
+            .put_json(
+                directory
+                    .parent()
+                    .unwrap()
+                    .join(incomplete_id.to_string())
+                    .join("manifest.json"),
+                &StoredSnapshotManifest {
+                    snapshot_id: incomplete_id,
+                    sandbox_id: "previously-terminated".into(),
+                    format: SnapshotFormat::FirecrackerFilesystemRef,
+                    provider: Some(SandboxProvider::Firecracker),
+                    created_at: chrono::Utc::now(),
+                    payload_size_bytes: 10,
+                    payload: None,
+                },
+            )
+            .await?;
+    }
+    fixture
+        .backend
+        .fail_snapshot_deletion
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        fixture
+            .agent
+            .delete_conversation(&first.record().id)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .harness
+            .inner
+            .storage
+            .get_bytes(&snapshot_paths[1])
+            .await
+            .is_ok()
+    );
+    assert!(
+        fixture
+            .agent
+            .get_conversation(&first.record().id)
+            .await?
+            .is_some()
+    );
+    fixture
+        .backend
+        .fail_snapshot_deletion
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        fixture
+            .agent
+            .delete_conversation(&first.record().id)
+            .await?
+    );
+    assert_eq!(
+        *fixture.backend.deleted_snapshots.lock().unwrap(),
+        vec![bytes::Bytes::from_static(b"first")]
+    );
+    assert!(
+        fixture
+            .harness
+            .inner
+            .storage
+            .get_bytes(&snapshot_paths[0])
+            .await
+            .is_ok()
+    );
+    assert!(
+        fixture
+            .harness
+            .inner
+            .storage
+            .get_bytes(&snapshot_paths[2])
+            .await
+            .is_ok()
+    );
+    assert!(
+        fixture
+            .harness
+            .delete_agent(&fixture.agent.record().id)
+            .await?
+    );
+    let mut deleted = fixture.backend.deleted_snapshots.lock().unwrap().clone();
+    deleted.sort();
+    assert_eq!(
+        deleted,
+        vec![
+            bytes::Bytes::from_static(b"agent"),
+            bytes::Bytes::from_static(b"first"),
+            bytes::Bytes::from_static(b"second")
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_publication_failure_cleans_capture_or_retains_cleanup_reference() -> Result<()> {
+    for (fail_after, fail_cleanup) in [(0, false), (1, false), (0, true), (1, true)] {
+        let fixture = Fixture::new().await?;
+        let sandbox_id = fixture.sandbox().await?;
+        fixture
+            .backend
+            .fail_snapshot_deletion
+            .store(fail_cleanup, std::sync::atomic::Ordering::Relaxed);
+        fixture
+            .harness
+            .inner
+            .storage
+            .fail_json_put_after(fail_after);
+        let error = fixture
+            .agent
+            .snapshot_sandbox(sandbox_id, crate::SnapshotKind::Filesystem)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected JSON object write failure"));
+        let owner_dir = fixture.harness.owner_dir(ResourceScope::Agent {
+            agent_id: fixture.agent.record().id,
+        });
+        let keys = fixture
+            .harness
+            .inner
+            .storage
+            .list_keys(owner_dir.join("snapshots"))
+            .await?;
+        assert_eq!(keys.len(), usize::from(fail_cleanup));
+        fixture
+            .backend
+            .fail_snapshot_deletion
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fixture
+                .harness
+                .delete_agent(&fixture.agent.record().id)
+                .await?
+        );
+        assert_eq!(
+            *fixture.backend.deleted_snapshots.lock().unwrap(),
+            vec![bytes::Bytes::from_static(b"capture")]
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn capture_reference_is_published_atomically_and_loads_without_payload_blob() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let sandbox_id = fixture.sandbox().await?;
+    let snapshot_id = fixture
+        .agent
+        .snapshot_sandbox(sandbox_id, crate::SnapshotKind::Filesystem)
+        .await?;
+    let owner_dir = fixture.harness.owner_dir(ResourceScope::Agent {
+        agent_id: fixture.agent.record().id,
+    });
+    let snapshot_dir = owner_dir.join("snapshots").join(snapshot_id.to_string());
+    assert_eq!(
+        fixture
+            .harness
+            .inner
+            .storage
+            .list_keys(&snapshot_dir)
+            .await?
+            .len(),
+        1
+    );
+    assert!(
+        fixture
+            .harness
+            .inner
+            .storage
+            .get_bytes_if_exists(snapshot_dir.join("payload.bin"))
+            .await?
+            .is_none()
+    );
+    let payload = load_snapshot_payload(&fixture.harness, &owner_dir, snapshot_id).await?;
+    assert_eq!(payload.format, SnapshotFormat::FirecrackerFilesystemRef);
+    assert_eq!(payload.bytes, bytes::Bytes::from_static(b"capture"));
+    assert!(
+        fixture
+            .harness
+            .delete_agent(&fixture.agent.record().id)
+            .await?
+    );
+    assert_eq!(
+        *fixture.backend.deleted_snapshots.lock().unwrap(),
+        vec![payload.bytes]
+    );
     Ok(())
 }

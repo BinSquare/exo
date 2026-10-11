@@ -1153,6 +1153,26 @@ pub(super) async fn snapshot_sandbox_side_effect(
     id: SandboxId,
     kind: crate::SnapshotKind,
 ) -> Result<(SnapshotId, EventData)> {
+    let (done, completion) = futures::channel::oneshot::channel();
+    let owned_harness = harness.clone();
+    let owner_dir = owner_dir.to_path_buf();
+    harness.inner.host.spawn(Box::pin(async move {
+        let result = capture_and_publish_snapshot(&owned_harness, &owner_dir, id, kind).await;
+        if let Err(result) = done.send(result)
+            && let Err(error) = result
+        {
+            tracing::error!(%error, "snapshot publication failed after caller cancellation");
+        }
+    }));
+    completion.await?
+}
+
+async fn capture_and_publish_snapshot(
+    harness: &BasicExoHarness,
+    owner_dir: &Path,
+    id: SandboxId,
+    kind: crate::SnapshotKind,
+) -> Result<(SnapshotId, EventData)> {
     let sandbox = load_stored_sandbox(harness, owner_dir, &id).await?;
     if sandbox.attachment.is_some() {
         bail!("attached sandboxes cannot be snapshotted");
@@ -1170,32 +1190,70 @@ pub(super) async fn snapshot_sandbox_side_effect(
     let payload = handle.snapshot(kind).await?;
 
     let _guard = harness.inner.write_lock.lock().await;
-    let mut sandbox = load_stored_sandbox(harness, owner_dir, &id).await?;
     let snapshot_id = Uuid7::now();
-
+    let is_capture = snapshot_capture_provider(&payload.format).is_some();
     let manifest = StoredSnapshotManifest {
         snapshot_id,
         sandbox_id: id.clone(),
-        format: payload.format,
+        format: payload.format.clone(),
+        provider: Some(sandbox.provider.clone()),
         created_at: Utc::now(),
         payload_size_bytes: payload.bytes.len() as u64,
+        payload: is_capture.then(|| payload.bytes.to_vec()),
     };
     let snapshot_dir = owner_dir.join("snapshots").join(snapshot_id.to_string());
     let storage = &harness.inner.storage;
-    futures::try_join!(
-        storage.put_bytes(snapshot_dir.join("payload.bin"), payload.bytes.to_vec()),
-        storage.put_json(snapshot_dir.join("manifest.json"), &manifest),
-    )?;
+    let result: Result<()> = async {
+        let mut sandbox = load_stored_sandbox(harness, owner_dir, &id).await?;
+        if manifest.payload.is_none() {
+            storage
+                .put_bytes(snapshot_dir.join("payload.bin"), payload.bytes.to_vec())
+                .await?;
+        }
+        storage
+            .put_json(snapshot_dir.join("manifest.json"), &manifest)
+            .await?;
+        sandbox.latest_snapshot_id = Some(snapshot_id);
+        storage
+            .put_json(
+                owner_dir.join("sandboxes").join(format!("{id}.json")),
+                &sandbox,
+            )
+            .await
+    }
+    .await;
+    if let Err(error) = result {
+        if is_capture {
+            let cleanup = async {
+                harness
+                    .inner
+                    .sandbox_backend_for_provider(sandbox.provider)
+                    .await?
+                    .delete_snapshot(payload)
+                    .await
+            }
+            .await;
+            if let Err(cleanup_error) = cleanup {
+                let error = error.context(format!("snapshot cleanup failed: {cleanup_error:#}"));
+                return match storage
+                    .put_json(snapshot_dir.join("manifest.json"), &manifest)
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(publication_error) => Err(error.context(format!(
+                        "retaining snapshot cleanup reference failed: {publication_error:#}"
+                    ))),
+                };
+            }
+        }
+        if let Err(cleanup_error) = storage.delete_prefix(&snapshot_dir).await {
+            return Err(error.context(format!(
+                "snapshot publication cleanup failed: {cleanup_error:#}"
+            )));
+        }
+        return Err(error);
+    }
 
-    sandbox.latest_snapshot_id = Some(snapshot_id);
-    harness
-        .inner
-        .storage
-        .put_json(
-            owner_dir.join("sandboxes").join(format!("{id}.json")),
-            &sandbox,
-        )
-        .await?;
     Ok((
         snapshot_id,
         EventData::SandboxSnapshotted {
@@ -1395,6 +1453,64 @@ pub(super) async fn start_sandbox_side_effect(
     }])
 }
 
+fn snapshot_capture_provider(format: &SnapshotFormat) -> Option<SandboxProvider> {
+    if *format == SnapshotFormat::SmolvmFilesystemRef {
+        Some(SandboxProvider::Smolvm)
+    } else if *format == SnapshotFormat::FirecrackerHostRef
+        || *format == SnapshotFormat::FirecrackerFilesystemRef
+    {
+        Some(SandboxProvider::Firecracker)
+    } else {
+        None
+    }
+}
+
+pub(super) async fn delete_owned_snapshots(
+    harness: &BasicExoHarness,
+    owner_dir: &Path,
+) -> Result<()> {
+    for manifest in harness
+        .inner
+        .storage
+        .list_json_matching_suffix::<StoredSnapshotManifest>(
+            owner_dir.join("snapshots"),
+            "manifest.json",
+        )
+        .await?
+    {
+        let Some(provider) = snapshot_capture_provider(&manifest.format) else {
+            continue;
+        };
+        let bytes = match manifest.payload {
+            Some(bytes) => bytes,
+            None => {
+                let directory = owner_dir
+                    .join("snapshots")
+                    .join(manifest.snapshot_id.to_string());
+                let Some(bytes) = harness
+                    .inner
+                    .storage
+                    .get_bytes_if_exists(directory.join("payload.bin"))
+                    .await?
+                else {
+                    continue;
+                };
+                bytes
+            }
+        };
+        let payload = SnapshotPayload {
+            format: manifest.format,
+            bytes: Bytes::from(bytes),
+        };
+        let backend = harness
+            .inner
+            .sandbox_backend_for_provider(manifest.provider.unwrap_or(provider))
+            .await?;
+        backend.delete_snapshot(payload).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn load_snapshot_payload(
     harness: &BasicExoHarness,
     owner_dir: &Path,
@@ -1404,18 +1520,19 @@ pub(super) async fn load_snapshot_payload(
     // payloads may live in a remote object store.
     let snapshot_dir = owner_dir.join("snapshots").join(snapshot_id.to_string());
     let storage = &harness.inner.storage;
-    let (manifest_result, payload_result) = futures::join!(
-        storage.get_json::<StoredSnapshotManifest>(snapshot_dir.join("manifest.json")),
-        storage.get_bytes(snapshot_dir.join("payload.bin")),
-    );
-    let manifest = manifest_result.with_context(|| {
-        format!(
-            "loading snapshot manifest for {} (have you taken a snapshot?)",
-            snapshot_id
-        )
-    })?;
-    let payload_bytes =
-        payload_result.with_context(|| format!("loading snapshot payload for {snapshot_id}"))?;
+    let manifest = storage
+        .get_json::<StoredSnapshotManifest>(snapshot_dir.join("manifest.json"))
+        .await
+        .with_context(|| {
+            format!("loading snapshot manifest for {snapshot_id} (have you taken a snapshot?)")
+        })?;
+    let payload_bytes = match manifest.payload {
+        Some(bytes) => bytes,
+        None => storage
+            .get_bytes(snapshot_dir.join("payload.bin"))
+            .await
+            .with_context(|| format!("loading snapshot payload for {snapshot_id}"))?,
+    };
     Ok(SnapshotPayload {
         format: manifest.format,
         bytes: Bytes::from(payload_bytes),
@@ -2275,8 +2392,9 @@ pub(super) async fn wait_for_sandbox_process_terminal_status(
 
 /// Sidecar JSON describing a snapshot payload.
 ///
-/// Lives at `{conversation_dir}/snapshots/{snapshot_id}/manifest.json` alongside
-/// the payload blob at `payload.bin`. The `format` controls how the payload is
+/// Lives at `{conversation_dir}/snapshots/{snapshot_id}/manifest.json`. Backend
+/// capture references are inline; other payloads live in `payload.bin` alongside it.
+/// The `format` controls how the payload is
 /// interpreted on restore — only a backend that declares that format can
 /// reconstruct a sandbox from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2285,8 +2403,12 @@ pub(super) struct StoredSnapshotManifest {
     pub(super) sandbox_id: SandboxId,
     #[serde(alias = "kind")]
     pub(super) format: SnapshotFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) provider: Option<SandboxProvider>,
     pub(super) created_at: DateTime<Utc>,
     pub(super) payload_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) payload: Option<Vec<u8>>,
 }
 
 pub(super) struct LiveSandboxProcess {

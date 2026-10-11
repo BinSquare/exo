@@ -55,7 +55,7 @@ ConversationHandle                     ManagedSandboxHandle
        ◄──── SnapshotPayload { format, bytes } ──┘
        │
   put_bytes / put_json
-  (manifest.json + payload.bin)
+  (manifest.json, plus payload.bin for artifact blobs)
        │                               ManagedSandboxBackend
   start_sandbox(req)                             │
        └── load manifest + payload ─► acquire_from_snapshot(req, payload)
@@ -130,7 +130,8 @@ format name includes a version when its wire representation can evolve.
 | `daytona-ref`                   | Daytona                           | Daytona                            |
 | `e2b-ref`                       | E2B                               | E2B                                |
 | `sprites-ref`                   | Sprites                           | Sprites                            |
-| `smolvm-machine-pack`           | SmolVM                            | SmolVM                             |
+| `smolvm-machine-pack`           | SmolVM (legacy)                   | SmolVM                             |
+| `smolvm-filesystem-ref-v1`      | SmolVM                            | SmolVM                             |
 | `firecracker-host-ref`          | Firecracker                       | Firecracker, Firecracker-over-Lima |
 | `firecracker-filesystem-ref-v1` | Firecracker                       | Firecracker, Firecracker-over-Lima |
 | `workspace-chunks-v1`           | reserved for workspace durability | none yet                           |
@@ -173,8 +174,13 @@ conversation-scoped artifacts:
 ```
 agents/<agent_id>/conversations/<conversation_id>/snapshots/<snapshot_id>/
 ├── manifest.json   JSON sidecar (StoredSnapshotManifest)
-└── payload.bin     raw blob (docker save tarball for `docker-image-tar`)
+└── payload.bin     raw blob for artifact formats such as `docker-image-tar`
 ```
+
+Backend capture references are stored in the manifest's optional `payload` field,
+so the capture reference and metadata publish in one object write. Older captures
+with a separate `payload.bin` still load. Failed publication deletes the backend
+capture; if cleanup fails, its reference is retained for owner deletion to retry.
 
 The manifest schema:
 
@@ -331,6 +337,14 @@ caller's host mount path with the captured contents. Callers must stop every
 sandbox sharing those paths before restoring, then restart them to remount the
 replacement directories or volumes. Existing mounts and open file descriptors
 can still refer to the previous contents.
+
+New SmolVM captures use `smolvm-filesystem-ref-v1`. Existing
+`smolvm-machine-pack` snapshots retain their `{machine, pack_path}` restore
+contract and need the referenced pack to remain on disk. Each new immutable
+capture stores its allocation total; publication sums these totals instead of
+walking historical mount trees. Deleting a conversation or agent releases its
+retained captures before deleting their references. Busy captures or cleanup
+failures keep the owner metadata available for retry.
 
 SmolVM's `SmolvmBackendConfig::snapshot_root` configures retained capture storage.
 The harness uses `cache/smolvm/filesystem-snapshots`; standalone backends default

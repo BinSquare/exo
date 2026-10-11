@@ -178,6 +178,41 @@ fn walk_allocated(root: &Path, inodes: &mut HashSet<(u64, u64)>, files_only: boo
     Ok(bytes)
 }
 
+pub(super) fn record_allocation(directory: &Path) -> Result<u64> {
+    let path = directory.join("allocated.bin");
+    fs::write(&path, 0u64.to_le_bytes())?;
+    File::open(&path)?.sync_all()?;
+    let bytes = allocated(directory)?;
+    fs::write(&path, bytes.to_le_bytes())?;
+    File::open(path)?.sync_all()?;
+    Ok(bytes)
+}
+
+pub(super) fn retained_allocation(root: &Path) -> Result<u64> {
+    let mut bytes = 0u64;
+    for directory in directories(root)? {
+        let directory = directory?;
+        if directory
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".capture-"))
+        {
+            continue;
+        }
+        let allocation = match fs::read(directory.join("allocated.bin")) {
+            Ok(allocation) => allocation,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let allocation: [u8; 8] = allocation
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid capture allocation total"))?;
+        bytes = bytes
+            .checked_add(u64::from_le_bytes(allocation))
+            .context("snapshot size overflow")?;
+    }
+    Ok(bytes)
+}
+
 pub(super) fn sync_tree(root: &Path) -> Result<()> {
     let mut count = 0;
     for entry in fs::read_dir(root)? {
@@ -195,7 +230,7 @@ fn sync_node(root: &Path, count: &mut usize) -> Result<()> {
             sync_node(&entry?.path(), count)?;
         }
     }
-    if !metadata.file_type().is_symlink() {
+    if metadata.is_file() || metadata.is_dir() {
         File::open(root)?.sync_all()?;
     }
     Ok(())
@@ -225,6 +260,51 @@ pub(super) fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn syncing_a_capture_skips_named_pipes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let fifo = root.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()?
+                .success()
+        );
+        fs::write(root.path().join("regular"), b"state")?;
+        let directory = root.path().to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || sender.send(sync_tree(&directory)).unwrap());
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        if result.is_err() {
+            let _writer = File::options()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)?;
+        }
+        worker.join().expect("capture sync panicked");
+        result.context("capture sync blocked on a FIFO")??;
+        Ok(())
+    }
+
+    #[test]
+    fn retained_allocation_reads_totals_without_walking_historical_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let capture = root.path().join("retained");
+        let volume = capture.join("volume");
+        fs::create_dir_all(&volume)?;
+        fs::write(volume.join("file"), b"state")?;
+        let expected = record_allocation(&capture)?;
+        let (pending, _lease) = staging_directory(root.path(), &root.path().join("budget.lock"))?;
+        fs::write(pending.path().join("allocated.bin"), u64::MAX.to_le_bytes())?;
+        fs::set_permissions(&volume, std::os::unix::fs::PermissionsExt::from_mode(0o000))?;
+        let retained = retained_allocation(root.path());
+        fs::set_permissions(&volume, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        assert_eq!(retained?, expected);
+        fs::remove_dir_all(capture)?;
+        assert_eq!(retained_allocation(root.path())?, 0);
+        Ok(())
+    }
+
     #[test]
     fn collection_skips_busy_and_corrupt_captures_and_reclaims_abandoned_staging() -> Result<()> {
         let root = tempfile::tempdir()?;

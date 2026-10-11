@@ -73,7 +73,10 @@ const INTERCEPTOR_FLAG: &str = "--egress-interceptor";
 const HOST_PATTERN_FLAG: &str = "--allow-host-pattern";
 const EXACT_HOST_POLICY_LABEL: &str = "exo.sandbox.exact-host-policy";
 const TCP_FORWARD_LABEL_PREFIX: &str = "exo.sandbox.tcp-forward.";
-static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::SmolvmMachinePack];
+static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 2] = [
+    SnapshotFormat::SmolvmMachinePack,
+    SnapshotFormat::SmolvmFilesystemRef,
+];
 
 /// What the installed smolvm supports. Probed once per backend.
 #[derive(Debug, Clone, Copy)]
@@ -597,6 +600,129 @@ impl SmolvmSandboxBackend {
         started
     }
 
+    #[cfg(unix)]
+    async fn restore_snapshot(
+        &self,
+        request: SandboxRequest,
+        payload: SnapshotPayload,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.spec.policy.validate_basic("smolvm")?;
+        if !CONSUMABLE_SNAPSHOT_FORMATS.contains(&payload.format) {
+            bail!(
+                "smolvm backend cannot restore snapshot format {}",
+                payload.format
+            );
+        }
+        self.require_capabilities(&request).await?;
+        let binary = self.binary().await?;
+        if self.resolve_mode(&request).await != SmolvmExecutionMode::Warm {
+            bail!(
+                "smolvm snapshots require warm mode (one-shot VMs hold no state to restore); \
+                 warm needs smolvm >= {MIN_WARM_VERSION}"
+            );
+        }
+
+        let (pack_path, capture) = if payload.format == SnapshotFormat::SmolvmFilesystemRef {
+            let manifest = filesystem::Manifest::parse(&payload)?;
+            let root = self.snapshot_root.clone();
+            let manifest_for_open = manifest.clone();
+            let lease =
+                tokio::task::spawn_blocking(move || filesystem::open(&root, &manifest_for_open))
+                    .await??;
+            (
+                lease.directory.join("machine.smolmachine"),
+                Some((manifest, Arc::new(lease))),
+            )
+        } else {
+            #[derive(Deserialize)]
+            struct LegacyManifest {
+                #[serde(rename = "machine")]
+                _machine: String,
+                pack_path: PathBuf,
+            }
+            let manifest: LegacyManifest = serde_json::from_slice(&payload.bytes)
+                .context("parse legacy smolvm machine pack")?;
+            ensure!(
+                manifest.pack_path.is_file(),
+                "smolvm snapshot pack is missing at {}",
+                manifest.pack_path.display()
+            );
+            (manifest.pack_path, None)
+        };
+        reject_unsupported_spec(&request.spec, &pack_path.to_string_lossy())?;
+        let machine = machine_name(request.sandbox_id.as_str());
+        let machine_guard =
+            Arc::new(filesystem::lock_machine(&self.snapshot_root, &machine).await?);
+        let mut status = Command::new(binary);
+        status.args(["machine", "status", "--name", &machine, "--json"]);
+        let status = status.output().await?;
+        if status.status.success() {
+            let status: MachineStatus = serde_json::from_slice(&status.stdout)?;
+            ensure!(
+                status.state == "stopped",
+                "snapshot restore target is still running"
+            );
+            self.delete_machine_if_present(&machine).await?;
+        } else {
+            ensure!(
+                cli_says::no_such_machine(&String::from_utf8_lossy(&status.stderr)),
+                "snapshot restore target cannot be inspected"
+            );
+        }
+        let mut restored_mounts = None;
+        let handle = self
+            .egress
+            .restore_with_proxy(
+                request.clone(),
+                self.external_proxy.as_ref(),
+                SmolvmProxy::start,
+                |egress| async {
+                    let mut request = request.clone();
+                    if let Some((manifest, lease)) = &capture {
+                        let manifest = manifest.clone();
+                        let lease = Arc::clone(lease);
+                        let guard = Arc::clone(&machine_guard);
+                        let (restored_request, mounts) = tokio::task::spawn_blocking(move || {
+                            let _guard = guard;
+                            let mounts = filesystem::restore_mounts(
+                                &lease.directory,
+                                &manifest,
+                                &mut request,
+                            )?;
+                            Ok::<_, anyhow::Error>((request, mounts))
+                        })
+                        .await??;
+                        request = restored_request;
+                        restored_mounts = Some(mounts);
+                    }
+                    self.ensure_machine_started(
+                        &machine,
+                        request,
+                        MachineSource::Pack(&pack_path),
+                        egress,
+                    )
+                    .await
+                },
+                self.delete_machine_if_present(&machine),
+            )
+            .await;
+        if let Some(mounts) = restored_mounts {
+            let restored = handle.is_ok();
+            tokio::task::spawn_blocking(move || {
+                let _guard = machine_guard;
+                if restored {
+                    mounts.keep();
+                } else {
+                    drop(mounts);
+                }
+            })
+            .await?;
+        }
+        let handle = handle?;
+        self.invalidate_tcp_forwards(&request.sandbox_id);
+        Ok(crate::with_process_management(handle))
+    }
+
     async fn existing_tcp_forwards(
         &self,
         machine: &str,
@@ -968,94 +1094,8 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.spec.policy.validate_basic("smolvm")?;
-        if payload.format != SnapshotFormat::SmolvmMachinePack {
-            bail!(
-                "smolvm backend cannot restore snapshot format {}",
-                payload.format
-            );
-        }
-        self.require_capabilities(&request).await?;
-        let binary = self.binary().await?;
-        if self.resolve_mode(&request).await != SmolvmExecutionMode::Warm {
-            bail!(
-                "smolvm snapshots require warm mode (one-shot VMs hold no state to restore); \
-                 warm needs smolvm >= {MIN_WARM_VERSION}"
-            );
-        }
-
-        let manifest = filesystem::Manifest::parse(&payload)?;
-        let root = self.snapshot_root.clone();
-        let manifest_for_open = manifest.clone();
-        let lease =
-            tokio::task::spawn_blocking(move || filesystem::open(&root, &manifest_for_open))
-                .await??;
-        let machine = machine_name(request.sandbox_id.as_str());
-        let _guard = filesystem::lock_machine(&self.snapshot_root, &machine).await?;
-        let mut status = Command::new(binary);
-        status.args(["machine", "status", "--name", &machine, "--json"]);
-        let status = status.output().await?;
-        if status.status.success() {
-            let status: MachineStatus = serde_json::from_slice(&status.stdout)?;
-            ensure!(
-                status.state == "stopped",
-                "snapshot restore target is still running"
-            );
-            self.delete_machine_if_present(&machine).await?;
-        } else {
-            ensure!(
-                cli_says::no_such_machine(&String::from_utf8_lossy(&status.stderr)),
-                "snapshot restore target cannot be inspected"
-            );
-        }
-        let mut restored_mounts = None;
-        let handle = self
-            .egress
-            .restore_with_proxy(
-                request.clone(),
-                self.external_proxy.as_ref(),
-                SmolvmProxy::start,
-                |egress| async {
-                    let mut request = request.clone();
-                    let pack_path = lease.directory.join("machine.smolmachine");
-                    let capture_directory = lease.directory.clone();
-                    let manifest = manifest.clone();
-                    let (restored_request, mounts) = tokio::task::spawn_blocking(move || {
-                        let mounts = filesystem::restore_mounts(
-                            &capture_directory,
-                            &manifest,
-                            &mut request,
-                        )?;
-                        Ok::<_, anyhow::Error>((request, mounts))
-                    })
-                    .await??;
-                    request = restored_request;
-                    restored_mounts = Some(mounts);
-                    self.ensure_machine_started(
-                        &machine,
-                        request,
-                        MachineSource::Pack(&pack_path),
-                        egress,
-                    )
-                    .await
-                },
-                self.delete_machine_if_present(&machine),
-            )
-            .await;
-        if let Some(mounts) = restored_mounts {
-            let succeeded = handle.is_ok();
-            tokio::task::spawn_blocking(move || {
-                if succeeded {
-                    mounts.keep();
-                } else {
-                    drop(mounts);
-                }
-            })
-            .await?;
-        }
-        let handle = handle?;
-        self.invalidate_tcp_forwards(&request.sandbox_id);
-        Ok(crate::with_process_management(handle))
+        let backend = self.clone();
+        tokio::spawn(async move { backend.restore_snapshot(request, payload).await }).await?
     }
 }
 
@@ -1133,6 +1173,7 @@ impl ManagedSandboxHandle for SmolvmOneShotHandle {
 }
 
 /// Persistent-machine handle: execs join a machine that stays booted.
+#[derive(Clone)]
 struct SmolvmWarmHandle {
     #[cfg(unix)]
     snapshot_root: PathBuf,
@@ -1294,39 +1335,50 @@ impl ManagedSandboxHandle for SmolvmWarmHandle {
             self.filesystem_snapshots,
             "complete filesystem capture requires smolvm {MIN_FILESYSTEM_SNAPSHOT_VERSION} or newer with --include-workspace"
         );
-        let _snapshot_guard = filesystem::lock_machine(&self.snapshot_root, &self.machine).await?;
-        let mut stop = Command::new(&self.binary);
-        stop.args(["machine", "stop", "--name", &self.machine]);
-        run_checked(stop, "smolvm machine stop").await?;
-        let result = async {
-            let root = self.snapshot_root.clone();
-            let (staging, _staging_lease) =
-                tokio::task::spawn_blocking(move || filesystem::staging_directory(&root)).await??;
-            let stub = staging.path().join("machine");
-            let mut pack = Command::new(&self.binary);
-            pack.args([
-                "pack",
-                "create",
-                "--from-vm",
-                &self.machine,
-                "--include-workspace",
-                "-o",
-            ])
-            .arg(&stub);
-            run_checked(pack, "smolvm filesystem pack").await?;
-            let request = self.request.clone();
-            let root = self.snapshot_root.clone();
-            tokio::task::spawn_blocking(move || filesystem::publish(&root, staging, &request))
+        let handle = self.clone();
+        tokio::spawn(async move {
+            let snapshot_guard =
+                Arc::new(filesystem::lock_machine(&handle.snapshot_root, &handle.machine).await?);
+            let mut stop = Command::new(&handle.binary);
+            stop.args(["machine", "stop", "--name", &handle.machine]);
+            run_checked(stop, "smolvm machine stop").await?;
+            let result = async {
+                let root = handle.snapshot_root.clone();
+                let (staging, staging_lease) =
+                    tokio::task::spawn_blocking(move || filesystem::staging_directory(&root))
+                        .await??;
+                let stub = staging.path().join("machine");
+                let mut pack = Command::new(&handle.binary);
+                pack.args([
+                    "pack",
+                    "create",
+                    "--from-vm",
+                    &handle.machine,
+                    "--include-workspace",
+                    "-o",
+                ])
+                .arg(&stub);
+                run_checked(pack, "smolvm filesystem pack").await?;
+                let request = handle.request.clone();
+                let root = handle.snapshot_root.clone();
+                let guard = Arc::clone(&snapshot_guard);
+                tokio::task::spawn_blocking(move || {
+                    let _guard = guard;
+                    let _lease = staging_lease;
+                    filesystem::publish(&root, staging, &request)
+                })
                 .await?
-        }
-        .await;
-        let mut start = Command::new(&self.binary);
-        start.args(["machine", "start", "--name", &self.machine]);
-        if let Some(egress) = &self.egress {
-            egress.proxy.configure(&mut start);
-        }
-        run_checked(start, "smolvm machine start after capture").await?;
-        result
+            }
+            .await;
+            let mut start = Command::new(&handle.binary);
+            start.args(["machine", "start", "--name", &handle.machine]);
+            if let Some(egress) = &handle.egress {
+                egress.proxy.configure(&mut start);
+            }
+            run_checked(start, "smolvm machine start after capture").await?;
+            result
+        })
+        .await?
     }
 }
 
@@ -2401,9 +2453,10 @@ esac"#,
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let events = std::fs::read_to_string(root.path().join("events"));
+        first.abort();
         std::fs::write(root.path().join("release"), b"release")?;
         let (first, second) = tokio::join!(first, second);
-        first??;
+        assert!(first.unwrap_err().is_cancelled());
         second??;
         assert_eq!(events?, "stop\npack\n");
         assert_eq!(
@@ -2498,6 +2551,68 @@ esac"#,
             lifecycle: SandboxLifecycleConfig { idle_ttl },
             provider_state: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_packs_restore_and_durable_storage_is_rejected_before_deletion() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let binary = root.path().join("smolvm");
+        write_test_binary(
+            &binary,
+            r#"
+root=$(dirname "$0")
+case "$1 $2" in
+  '--version ') printf 'smolvm 1.20.0\n';;
+  'machine status') printf '{"state":"stopped"}\n';;
+  *) printf '%s\n' "$*" >> "$root/events";;
+esac"#,
+        );
+        let backend = SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
+            binary: Some(binary),
+            mode: SmolvmExecutionMode::Warm,
+            snapshot_root: Some(root.path().join("captures")),
+            ..Default::default()
+        });
+        let pack = root.path().join("legacy.smolmachine");
+        std::fs::write(&pack, b"legacy pack")?;
+        let payload = SnapshotPayload {
+            format: SnapshotFormat::SmolvmMachinePack,
+            bytes: serde_json::to_vec(&json!({ "machine": "old", "pack_path": pack }))?.into(),
+        };
+        let request = test_request(Some(Duration::from_secs(60)));
+        let mut unsupported = request.clone();
+        unsupported
+            .spec
+            .durable_file_systems
+            .push(crate::DurableFileSystem {
+                name: "cache".into(),
+                mount_path: "/cache".into(),
+                mode: crate::FileSystemMountMode::ReadWrite,
+            });
+        let error = backend
+            .acquire_from_snapshot(unsupported, payload.clone())
+            .await
+            .err()
+            .context("durable storage must be rejected")?;
+        assert!(
+            error
+                .to_string()
+                .contains("cannot provide durable file systems")
+        );
+        assert!(!root.path().join("events").exists());
+        let handle = backend
+            .acquire_from_snapshot(request.clone(), payload)
+            .await?;
+        let events = std::fs::read_to_string(root.path().join("events"))?;
+        assert!(events.contains("machine delete"), "{events}");
+        assert!(
+            events.contains(&format!("--from {}", pack.display())),
+            "{events}"
+        );
+        drop(handle);
+        backend.terminate(request).await?;
+        Ok(())
     }
 
     /// Never downgraded by version probing or by the request's lifecycle.
