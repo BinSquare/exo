@@ -365,23 +365,36 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn directory_captures_restore_independently_and_hold_deletion_leases() -> Result<()> {
+        use std::io::Read;
         let root = tempfile::tempdir()?;
         let workspace = root.path().join("source");
-        let (request, payload) = capture_fixture(root.path(), vec![mount(&workspace, "/repo")])?;
+        let (mut request, payload) =
+            capture_fixture(root.path(), vec![mount(&workspace, "/repo")])?;
         let manifest = Manifest::parse(&payload)?;
         let lease = open(root.path(), &manifest)?;
+        let peer = request.clone();
         fs::write(workspace.join("marker"), b"later")?;
+        let mut attached = File::open(peer.spec.mounts[0].host_path.join("marker"))?;
         let mut first = request.clone();
         first.spec.mounts[0].host_path = root.path().join("first");
         restore_mounts(&lease.directory, &manifest, &mut first)?.keep();
         fs::write(first.spec.mounts[0].host_path.join("marker"), b"edited")?;
-        let mut second = request;
+        let mut second = request.clone();
         second.spec.mounts[0].host_path = root.path().join("second");
         restore_mounts(&lease.directory, &manifest, &mut second)?.keep();
         assert_eq!(
             fs::read(second.spec.mounts[0].host_path.join("marker"))?,
             b"captured"
         );
+        restore_mounts(&lease.directory, &manifest, &mut request)?.keep();
+        assert_eq!(request.spec.mounts[0].host_path, workspace);
+        assert_eq!(
+            fs::read(peer.spec.mounts[0].host_path.join("marker"))?,
+            b"captured"
+        );
+        let mut previous = Vec::new();
+        attached.read_to_end(&mut previous)?;
+        assert_eq!(previous, b"later");
         assert!(delete(root.path(), &payload).is_err());
         drop(lease);
         delete(root.path(), &payload)?;
@@ -402,30 +415,6 @@ mod tests {
         let count = fs::read_dir(captures.with_extension("locks"))?.count();
         assert_eq!(count, slots.len());
         assert!(count <= 256);
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn directory_restore_rewinds_shared_paths_but_requires_peers_to_remount() -> Result<()> {
-        use std::io::Read;
-        let root = tempfile::tempdir()?;
-        let shared = root.path().join("shared");
-        let (mut request, payload) = capture_fixture(root.path(), vec![mount(&shared, "/repo")])?;
-        let peer = request.clone();
-        fs::write(shared.join("marker"), b"later")?;
-        let mut attached = File::open(peer.spec.mounts[0].host_path.join("marker"))?;
-        let manifest = Manifest::parse(&payload)?;
-        let lease = open(root.path(), &manifest)?;
-        restore_mounts(&lease.directory, &manifest, &mut request)?.keep();
-        assert_eq!(request.spec.mounts[0].host_path, shared);
-        assert_eq!(
-            fs::read(peer.spec.mounts[0].host_path.join("marker"))?,
-            b"captured"
-        );
-        let mut previous = Vec::new();
-        attached.read_to_end(&mut previous)?;
-        assert_eq!(previous, b"later");
         Ok(())
     }
 

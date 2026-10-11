@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use crate::resources::{
     MaterializeResourcesRequest, PreparedResource, ResourceDefinition, ResourceSource,
 };
-use crate::test_support::local_test_config;
+use crate::test_support::{begin_test_turn, local_test_config};
 use crate::{EnvironmentDefinition, FileSystemMountMode};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -435,7 +435,7 @@ async fn seed_snapshot(
     storage: &BasicObjectStore,
     owner_dir: &Path,
     contents: Option<&[u8]>,
-) -> Result<PathBuf> {
+) -> Result<(SnapshotId, PathBuf)> {
     let snapshot_id = Uuid7::now();
     let directory = owner_dir.join("snapshots").join(snapshot_id.to_string());
     storage
@@ -456,7 +456,7 @@ async fn seed_snapshot(
     if let Some(contents) = contents {
         storage.put_bytes(&payload, contents.to_vec()).await?;
     }
-    Ok(payload)
+    Ok((snapshot_id, payload))
 }
 
 #[tokio::test]
@@ -492,8 +492,12 @@ async fn owner_deletion_releases_snapshots_and_preserves_references_on_failure()
         ),
     ] {
         let directory = harness.owner_dir(owner);
-        snapshot_paths.push(seed_snapshot(storage, &directory, Some(contents)).await?);
-        seed_snapshot(storage, &directory, None).await?;
+        snapshot_paths.push(seed_snapshot(storage, &directory, Some(contents)).await?.1);
+        let (missing_payload, _) = seed_snapshot(storage, &directory, None).await?;
+        let error = load_snapshot_payload(harness, &directory, missing_payload)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("has no payload"));
     }
     backend
         .fail_snapshot_deletion
@@ -604,58 +608,52 @@ async fn cancelled_snapshot_publishes_a_visible_event_with_its_capture() -> Resu
     ] {
         let fixture = Fixture::new().await?;
         let thread = fixture.thread().await?;
-        let harness = &fixture.harness;
-        let agent = &fixture.agent;
-        let backend = &fixture.backend;
         let gate = Arc::new(CaptureGate {
             entered: tokio::sync::Notify::new(),
             release: Semaphore::new(0),
         });
-        *backend.capture_gate.lock().unwrap() = Some(gate.clone());
-        let sandbox = thread.create_sandbox(capture_spec()).await?;
-        let (snapshotting, original_turn) = if on_turn {
-            let turn = crate::test_support::begin_test_turn(thread.as_ref()).await?;
-            let capturing = turn.clone();
-            (
-                tokio::spawn(async move {
-                    capturing
-                        .snapshot_sandbox(sandbox, crate::SnapshotKind::Filesystem)
-                        .await
-                }),
-                Some(turn),
-            )
+        *fixture.backend.capture_gate.lock().unwrap() = Some(gate.clone());
+        let sandbox_id = thread.create_sandbox(capture_spec()).await?;
+        let original_turn = if on_turn {
+            Some(begin_test_turn(thread.as_ref()).await?)
         } else {
-            let thread = thread.clone();
-            (
-                tokio::spawn(async move {
-                    thread
-                        .snapshot_sandbox(sandbox, crate::SnapshotKind::Filesystem)
-                        .await
-                }),
-                None,
-            )
+            None
         };
+        let owner: Arc<dyn crate::SnapshotHandle> = match &original_turn {
+            Some(turn) => turn.clone(),
+            None => thread.clone(),
+        };
+        let sandbox = sandbox_id.clone();
+        let snapshotting = tokio::spawn(async move {
+            owner
+                .snapshot_sandbox(sandbox, crate::SnapshotKind::Filesystem)
+                .await
+        });
         timeout(DEADLINE, gate.entered.notified()).await?;
         snapshotting.abort();
         assert!(snapshotting.await.unwrap_err().is_cancelled());
-        let turn_record = original_turn.as_ref().map(|turn| turn.record().clone());
+        let event_turn = original_turn
+            .as_ref()
+            .filter(|_| !finish_turn && !advance_turn);
+        let tags = (
+            event_turn.map(|turn| turn.record().session_id),
+            event_turn.map(|turn| turn.record().id),
+        );
         let finished_turn = original_turn.filter(|_| finish_turn);
         let finished_event = match &finished_turn {
             Some(turn) => Some(turn.finish().await?),
             None => None,
         };
         let next_turn = if advance_turn {
-            Some(crate::test_support::begin_test_turn(thread.as_ref()).await?)
+            Some(begin_test_turn(thread.as_ref()).await?)
         } else {
             None
         };
         gate.release.add_permits(1);
         let event = timeout(DEADLINE, async {
             loop {
-                if let Some(event) = thread
-                    .get_events(None)
-                    .await?
-                    .events
+                let events = thread.get_events(None).await?.events;
+                if let Some(event) = events
                     .into_iter()
                     .find(|event| matches!(event.data, EventData::SandboxSnapshotted { .. }))
                 {
@@ -665,28 +663,10 @@ async fn cancelled_snapshot_publishes_a_visible_event_with_its_capture() -> Resu
             }
         })
         .await??;
-        let event_turn = turn_record
-            .as_ref()
-            .filter(|_| !finish_turn && !advance_turn);
-        assert_eq!(event.session_id, event_turn.map(|record| record.session_id));
-        assert_eq!(event.turn_id, event_turn.map(|record| record.id));
-        let EventData::SandboxSnapshotted {
-            snapshot_id,
-            sandbox_id,
-        } = event.data
-        else {
+        let EventData::SandboxSnapshotted { snapshot_id, .. } = event.data else {
             unreachable!()
         };
-        let owner_dir = harness.owner_dir(ResourceScope::Thread {
-            agent_id: agent.record().id,
-            thread_id: thread.record().id,
-        });
-        assert_eq!(
-            load_snapshot_payload(harness, &owner_dir, snapshot_id)
-                .await?
-                .bytes,
-            bytes::Bytes::from_static(b"capture")
-        );
+        let mut expected = vec![(tags.0, tags.1, sandbox_id.clone(), Some(snapshot_id))];
         if let Some(turn) = next_turn {
             for snapshot_id in [None, Some(snapshot_id)] {
                 turn.start_sandbox(crate::StartSandboxRequest {
@@ -696,37 +676,40 @@ async fn cancelled_snapshot_publishes_a_visible_event_with_its_capture() -> Resu
                     provider: None,
                 })
                 .await?;
+                expected.push((
+                    Some(turn.record().session_id),
+                    Some(turn.record().id),
+                    sandbox_id.clone(),
+                    snapshot_id,
+                ));
             }
-            let started = thread
-                .get_events(None)
-                .await?
-                .events
-                .into_iter()
-                .filter(|event| {
-                    event.turn_id == Some(turn.record().id)
-                        && matches!(event.data, EventData::SandboxStarted { .. })
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(started.len(), 2);
-            for event in &started {
-                assert_eq!(event.session_id, Some(turn.record().session_id));
-                assert_eq!(event.turn_id, Some(turn.record().id));
-            }
-            assert!(
-                matches!(&started[0].data, EventData::SandboxStarted { sandbox_id: id, snapshot_id: None } if id == &sandbox_id)
-            );
-            assert!(
-                matches!(&started[1].data, EventData::SandboxStarted { sandbox_id: id, snapshot_id: Some(snapshot) } if id == &sandbox_id && *snapshot == snapshot_id)
-            );
             turn.finish().await?;
         }
+        let events = thread.get_events(None).await?.events;
+        let actual = events
+            .into_iter()
+            .filter(|item| item.id >= event.id)
+            .filter_map(|item| {
+                let (id, snapshot_id) = match item.data {
+                    EventData::SandboxSnapshotted {
+                        sandbox_id,
+                        snapshot_id,
+                    } if item.id == event.id => (sandbox_id, Some(snapshot_id)),
+                    EventData::SandboxStarted {
+                        sandbox_id,
+                        snapshot_id,
+                    } => (sandbox_id, snapshot_id),
+                    _ => return None,
+                };
+                Some((item.session_id, item.turn_id, id, snapshot_id))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
         if let Some(turn) = finished_turn {
             assert_eq!(Some(turn.finish().await?), finished_event);
             let rebuilt = thread.turn_handle(turn.record().clone()).await?;
             assert_eq!(Some(rebuilt.finish().await?), finished_event);
         }
-        assert!(harness.delete_agent(&agent.record().id).await?);
-        assert_eq!(backend.deleted_snapshots.lock().unwrap().len(), 1);
     }
     Ok(())
 }

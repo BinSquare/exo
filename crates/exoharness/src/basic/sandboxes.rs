@@ -1141,49 +1141,41 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     pub(super) async fn append_events_locked(&self, data: Vec<EventData>) -> Result<()> {
         self.harness.check(self.owner).await?;
-        match &self.event_sink {
-            BasicSandboxEventSink::None => Ok(()),
+        let (conversation_id, session_id, turn_id, state) = match &self.event_sink {
+            BasicSandboxEventSink::None => return Ok(()),
             BasicSandboxEventSink::Conversation { conversation_id } => {
-                let mut record =
-                    load_conversation_record(&self.harness.inner.storage, &self.owner_dir).await?;
-                append_events_to_conversation(
-                    &self.harness.inner,
-                    &self.owner_dir,
-                    *conversation_id,
-                    None,
-                    None,
-                    record.latest_event_id,
-                    data,
-                    &mut record,
-                )
-                .await?;
-                Ok(())
+                (*conversation_id, None, None, None)
             }
             BasicSandboxEventSink::Turn {
                 conversation_id,
                 session_id,
                 turn_id,
                 state,
-            } => {
-                let mut record =
-                    load_conversation_record(&self.harness.inner.storage, &self.owner_dir).await?;
-                let expected_head = record.latest_event_id;
-                let add_result = append_events_to_conversation(
-                    &self.harness.inner,
-                    &self.owner_dir,
-                    *conversation_id,
-                    Some(*session_id),
-                    Some(*turn_id),
-                    expected_head,
-                    data,
-                    &mut record,
-                )
-                .await?;
-                state.lock().expect("turn state poisoned").latest_event_id =
-                    Some(add_result.latest_event_id);
-                Ok(())
-            }
+            } => (
+                *conversation_id,
+                Some(*session_id),
+                Some(*turn_id),
+                Some(state),
+            ),
+        };
+        let mut record =
+            load_conversation_record(&self.harness.inner.storage, &self.owner_dir).await?;
+        let add_result = append_events_to_conversation(
+            &self.harness.inner,
+            &self.owner_dir,
+            conversation_id,
+            session_id,
+            turn_id,
+            record.latest_event_id,
+            data,
+            &mut record,
+        )
+        .await?;
+        if let Some(state) = state {
+            state.lock().expect("turn state poisoned").latest_event_id =
+                Some(add_result.latest_event_id);
         }
+        Ok(())
     }
 }
 
@@ -1506,22 +1498,14 @@ pub(super) async fn delete_owned_snapshots(
         let Some(provider) = snapshot_capture_provider(&manifest.format) else {
             continue;
         };
-        let bytes = match manifest.payload {
-            Some(bytes) => bytes,
-            None => {
-                let directory = owner_dir
-                    .join("snapshots")
-                    .join(manifest.snapshot_id.to_string());
-                let Some(bytes) = harness
-                    .inner
-                    .storage
-                    .get_bytes_if_exists(directory.join("payload.bin"))
-                    .await?
-                else {
-                    continue;
-                };
-                bytes
-            }
+        let directory = owner_dir
+            .join("snapshots")
+            .join(manifest.snapshot_id.to_string());
+        let Some(bytes) =
+            snapshot_payload_bytes_if_exists(&harness.inner.storage, &directory, manifest.payload)
+                .await?
+        else {
+            continue;
         };
         let payload = SnapshotPayload {
             format: manifest.format,
@@ -1551,17 +1535,29 @@ pub(super) async fn load_snapshot_payload(
         .with_context(|| {
             format!("loading snapshot manifest for {snapshot_id} (have you taken a snapshot?)")
         })?;
-    let payload_bytes = match manifest.payload {
-        Some(bytes) => bytes,
-        None => storage
-            .get_bytes(snapshot_dir.join("payload.bin"))
-            .await
-            .with_context(|| format!("loading snapshot payload for {snapshot_id}"))?,
-    };
+    let payload_bytes = snapshot_payload_bytes_if_exists(storage, &snapshot_dir, manifest.payload)
+        .await
+        .with_context(|| format!("loading snapshot payload for {snapshot_id}"))?
+        .with_context(|| format!("snapshot {snapshot_id} has no payload"))?;
     Ok(SnapshotPayload {
         format: manifest.format,
         bytes: Bytes::from(payload_bytes),
     })
+}
+
+async fn snapshot_payload_bytes_if_exists(
+    storage: &BasicObjectStore,
+    directory: &Path,
+    payload: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    match payload {
+        Some(bytes) => Ok(Some(bytes)),
+        None => {
+            storage
+                .get_bytes_if_exists(directory.join("payload.bin"))
+                .await
+        }
+    }
 }
 
 pub(super) fn ensure_snapshot_format_supported(
