@@ -54,6 +54,8 @@ pub(super) struct Lease {
 }
 
 pub(super) async fn lock_machine(root: &Path, machine: &str) -> Result<SnapshotLease> {
+    // Slots can collide, and these file locks are not reentrant within a process.
+    // Never hold more than one machine lock at a time, even for different machines.
     let directory = root.with_extension("locks");
     let slot = Sha256::digest(machine.as_bytes())[0];
     tokio::task::spawn_blocking(move || {

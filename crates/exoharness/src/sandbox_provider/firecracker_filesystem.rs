@@ -640,11 +640,11 @@ fn prepare_imported_base(
 ) -> Result<()> {
     let cached = base_image_cache_path(config, digest);
     if !cached.try_exists()? {
+        copy_sparse_reflink(source, target)?;
         ensure!(
-            super::super::firecracker_image::sha256_hex_of_file(source)? == digest,
+            super::super::firecracker_image::sha256_hex_of_file(target)? == digest,
             "filesystem import base image does not match"
         );
-        copy_sparse_reflink(source, target)?;
         fs::set_permissions(target, Permissions::from_mode(0o444))?;
         cache_base_image(config, target, digest)?;
         fs::remove_file(target)?;

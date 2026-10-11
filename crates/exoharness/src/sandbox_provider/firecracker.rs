@@ -4074,8 +4074,10 @@ fn prepare_resource_drives(
     for (index, mount) in request.spec.mounts.iter().enumerate() {
         let source = resource_disk(config, request.scope, &mount.host_path)?;
         let target = root.join(format!("resource-{index}.ext4"));
-        if !pre_staged {
-            let _lock = capture_store::exclusive_lock(&source.with_extension("lock"))?;
+        let _lock = if pre_staged {
+            None
+        } else {
+            let lock = capture_store::exclusive_lock(&source.with_extension("lock"))?;
             if target.try_exists()? {
                 fs::remove_file(&target)?;
             }
@@ -4083,10 +4085,9 @@ fn prepare_resource_drives(
                 fs::metadata(&source)?.nlink() == 1,
                 "resource disk is already attached to another sandbox"
             );
-            link_durable_disk(&source, &target, false)?;
-        } else {
-            link_durable_disk(&source, &target, true)?;
-        }
+            Some(lock)
+        };
+        link_durable_disk(&source, &target, pre_staged)?;
         chown(&target, Some(host_uid), Some(host_uid))?;
         fs::set_permissions(&target, Permissions::from_mode(0o600))?;
     }
