@@ -1413,6 +1413,7 @@ impl FirecrackerSandboxBackend {
         let terminate = self.shutdown_request(request.clone(), ShutdownMode::Terminate);
         self.egress
             .acquire(
+                crate::egress::AcquisitionMode::Acquire,
                 request.clone(),
                 self.external_proxy.as_ref(),
                 |policy| async move { self.egress_transport(&policy).await },

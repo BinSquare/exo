@@ -152,7 +152,6 @@ impl FilesystemManifest {
 
 /// Immutable disk files for checkpoint upload. Holding this guard prevents deletion.
 pub struct FirecrackerFilesystemCapture {
-    pub payload: SnapshotPayload,
     pub base_image: PathBuf,
     pub disks: Vec<PathBuf>,
     _lease: SnapshotLease,
@@ -192,7 +191,6 @@ fn open_capture(
         "filesystem snapshot base image is invalid"
     );
     Ok(FirecrackerFilesystemCapture {
-        payload,
         base_image,
         disks,
         _lease: lease,
@@ -326,7 +324,8 @@ impl FirecrackerSandboxBackend {
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let terminate = self.shutdown_request(request.clone(), ShutdownMode::Terminate);
         self.egress
-            .restore(
+            .acquire(
+                crate::egress::AcquisitionMode::Restore,
                 request.clone(),
                 self.external_proxy.as_ref(),
                 |policy| async move { self.egress_transport(&policy).await },
@@ -742,6 +741,32 @@ impl InstalledDisks {
     }
 }
 
+fn lock_restore_destinations(targets: &[(PathBuf, Option<PathBuf>)]) -> Result<Vec<SnapshotLease>> {
+    let mut persistent = targets
+        .iter()
+        .filter_map(|(_, target)| target.clone())
+        .collect::<Vec<_>>();
+    persistent.sort();
+    ensure!(
+        persistent.windows(2).all(|pair| pair[0] != pair[1]),
+        "duplicate filesystem restore destination"
+    );
+    let mut locks = Vec::new();
+    for target in persistent {
+        locks.push(capture_store::exclusive_lock(
+            &target.with_extension("lock"),
+        )?);
+        if target.try_exists()? {
+            ensure!(
+                fs::symlink_metadata(&target)?.is_file() && fs::metadata(&target)?.nlink() == 1,
+                "filesystem restore disk is already attached: {}",
+                target.display()
+            );
+        }
+    }
+    Ok(locks)
+}
+
 fn install_disks(
     config: &FirecrackerConfig,
     record: &MachineRecord,
@@ -771,25 +796,7 @@ fn install_disks(
             ));
         }
     }
-    let mut persistent = targets
-        .iter()
-        .filter_map(|(_, target)| target.clone())
-        .collect::<Vec<_>>();
-    persistent.sort();
-    persistent.dedup();
-    let mut locks = Vec::new();
-    for target in persistent {
-        locks.push(capture_store::exclusive_lock(
-            &target.with_extension("lock"),
-        )?);
-        if target.try_exists()? {
-            ensure!(
-                fs::symlink_metadata(&target)?.is_file() && fs::metadata(&target)?.nlink() == 1,
-                "filesystem restore disk is already attached: {}",
-                target.display()
-            );
-        }
-    }
+    let locks = lock_restore_destinations(&targets)?;
     ensure!(
         capture.disks.len() == targets.len(),
         "capture disk count differs from restore layout"
@@ -798,20 +805,14 @@ fn install_disks(
         targets: Vec::new(),
         _locks: locks,
     };
-    let mut staged = HashMap::<PathBuf, PathBuf>::new();
     for (source, (jailed, target)) in capture.disks.iter().zip(targets) {
         if jailed.try_exists()? {
             fs::remove_file(&jailed)?;
-        }
-        if let Some(existing) = target.as_ref().and_then(|target| staged.get(target)) {
-            fs::hard_link(existing, &jailed)?;
-            continue;
         }
         copy_sparse_reflink(source, &jailed)?;
         fs::set_permissions(&jailed, Permissions::from_mode(0o600))?;
         File::open(&jailed)?.sync_all()?;
         if let Some(target) = target {
-            staged.insert(target.clone(), jailed.clone());
             installed.targets.push((jailed, target));
         }
     }

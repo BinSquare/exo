@@ -1696,10 +1696,10 @@ impl ConversationHandle for BasicConversationHandle {
             conversation_id: self.record.id,
             record: turn_record,
             event_batch_index: self.event_batch_index.clone(),
-            state: Mutex::new(BasicTurnState {
+            state: Arc::new(Mutex::new(BasicTurnState {
                 latest_event_id: Some(add_result.latest_event_id),
                 finished: false,
-            }),
+            })),
         }))
     }
 
@@ -1735,10 +1735,10 @@ impl ConversationHandle for BasicConversationHandle {
             conversation_id: self.record.id,
             record,
             event_batch_index: Arc::clone(&self.event_batch_index),
-            state: Mutex::new(BasicTurnState {
+            state: Arc::new(Mutex::new(BasicTurnState {
                 latest_event_id,
                 finished,
-            }),
+            })),
         }))
     }
 
@@ -2165,7 +2165,7 @@ struct BasicTurnHandle {
     conversation_id: ConversationId,
     record: TurnRecord,
     event_batch_index: Arc<Mutex<Option<EventBatchIndex>>>,
-    state: Mutex<BasicTurnState>,
+    state: Arc<Mutex<BasicTurnState>>,
 }
 
 struct BasicTurnState {

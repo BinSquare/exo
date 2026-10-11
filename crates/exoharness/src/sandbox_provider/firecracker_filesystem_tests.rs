@@ -28,6 +28,28 @@ fn fixture(config: &FirecrackerConfig) -> Result<SnapshotPayload> {
 }
 
 #[test]
+fn duplicate_restore_destinations_are_rejected() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("resource.ext4");
+    fs::write(&target, b"existing disk")?;
+    let targets = [
+        (root.path().join("resource-0.ext4"), Some(target.clone())),
+        (root.path().join("resource-1.ext4"), Some(target.clone())),
+    ];
+    let error = lock_restore_destinations(&targets)
+        .err()
+        .context("duplicate destinations must fail")?;
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate filesystem restore destination")
+    );
+    assert_eq!(fs::read(&target)?, b"existing disk");
+    assert!(!target.with_extension("lock").exists());
+    Ok(())
+}
+
+#[test]
 fn required_disks_are_validated_and_upload_lease_prevents_deletion() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let config = FirecrackerConfig {

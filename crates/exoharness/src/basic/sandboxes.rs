@@ -127,10 +127,11 @@ pub(super) struct BasicScopedSandboxHandle<'a> {
     pub(super) harness: &'a BasicExoHarness,
     pub(super) owner_dir: PathBuf,
     pub(super) owner: ResourceScope,
-    pub(super) event_sink: BasicSandboxEventSink<'a>,
+    pub(super) event_sink: BasicSandboxEventSink,
 }
 
-pub(super) enum BasicSandboxEventSink<'a> {
+#[derive(Clone)]
+pub(super) enum BasicSandboxEventSink {
     None,
     Conversation {
         conversation_id: ConversationId,
@@ -139,7 +140,7 @@ pub(super) enum BasicSandboxEventSink<'a> {
         conversation_id: ConversationId,
         session_id: SessionId,
         turn_id: TurnId,
-        state: &'a Mutex<BasicTurnState>,
+        state: Arc<Mutex<BasicTurnState>>,
     },
 }
 
@@ -177,7 +178,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         conversation_dir: PathBuf,
         session_id: SessionId,
         turn_id: TurnId,
-        state: &'a Mutex<BasicTurnState>,
+        state: &'a Arc<Mutex<BasicTurnState>>,
     ) -> Self {
         Self {
             harness,
@@ -190,7 +191,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 conversation_id,
                 session_id,
                 turn_id,
-                state,
+                state: Arc::clone(state),
             },
         }
     }
@@ -478,10 +479,49 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         kind: crate::SnapshotKind,
     ) -> Result<SnapshotId> {
         self.harness.check(self.owner).await?;
-        let (snapshot_id, event) =
-            snapshot_sandbox_side_effect(self.harness, &self.owner_dir, id, kind).await?;
-        self.append_events(vec![event]).await?;
-        Ok(snapshot_id)
+        let (done, completion) = futures::channel::oneshot::channel();
+        let harness = self.harness.clone();
+        let owner_dir = self.owner_dir.clone();
+        let owner = self.owner;
+        let event_sink = self.event_sink.clone();
+        self.harness.inner.host.spawn(Box::pin(async move {
+            let mut scope = BasicScopedSandboxHandle {
+                harness: &harness,
+                owner_dir,
+                owner,
+                event_sink,
+            };
+            let result = async {
+                let (snapshot_id, event) =
+                    capture_and_publish_snapshot(&harness, &scope.owner_dir, id, kind).await?;
+                let _guard = harness.inner.write_lock.lock().await;
+                if let BasicSandboxEventSink::Turn {
+                    conversation_id,
+                    state,
+                    ..
+                } = &scope.event_sink
+                {
+                    let current_head =
+                        latest_committed_event_id(&harness.inner.storage, &scope.owner_dir).await?;
+                    let stale = {
+                        let state = state.lock().expect("turn state poisoned");
+                        state.finished || state.latest_event_id != current_head
+                    };
+                    if stale {
+                        scope.event_sink = BasicSandboxEventSink::Conversation {
+                            conversation_id: *conversation_id,
+                        };
+                    }
+                }
+                scope.append_events_locked(vec![event]).await?;
+                Ok(snapshot_id)
+            }
+            .await;
+            if let Err(Err(error)) = done.send(result) {
+                tracing::error!(%error, "snapshot publication failed after caller cancellation");
+            }
+        }));
+        completion.await?
     }
 
     pub(super) async fn start_sandbox(&self, request: StartSandboxRequest) -> Result<()> {
@@ -949,7 +989,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         request: &PreparedSandboxRequest,
     ) -> Result<Option<(SandboxId, StoredSandbox)>> {
         self.harness.check(self.owner).await?;
-        match self.event_sink {
+        match &self.event_sink {
             BasicSandboxEventSink::None => {
                 find_matching_stored_sandbox(
                     &self.harness.inner.storage,
@@ -1078,12 +1118,12 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     pub(super) fn process_event_log(&self) -> Option<SandboxProcessEventLog> {
-        match self.event_sink {
+        match &self.event_sink {
             BasicSandboxEventSink::None | BasicSandboxEventSink::Turn { .. } => None,
             BasicSandboxEventSink::Conversation { conversation_id } => {
                 Some(SandboxProcessEventLog {
                     inner: Arc::clone(&self.harness.inner),
-                    conversation_id,
+                    conversation_id: *conversation_id,
                     conversation_dir: self.owner_dir.clone(),
                 })
             }
@@ -1101,7 +1141,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     pub(super) async fn append_events_locked(&self, data: Vec<EventData>) -> Result<()> {
         self.harness.check(self.owner).await?;
-        match self.event_sink {
+        match &self.event_sink {
             BasicSandboxEventSink::None => Ok(()),
             BasicSandboxEventSink::Conversation { conversation_id } => {
                 let mut record =
@@ -1109,7 +1149,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 append_events_to_conversation(
                     &self.harness.inner,
                     &self.owner_dir,
-                    conversation_id,
+                    *conversation_id,
                     None,
                     None,
                     record.latest_event_id,
@@ -1125,15 +1165,15 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 turn_id,
                 state,
             } => {
-                let expected_head = state.lock().expect("turn state poisoned").latest_event_id;
                 let mut record =
                     load_conversation_record(&self.harness.inner.storage, &self.owner_dir).await?;
+                let expected_head = record.latest_event_id;
                 let add_result = append_events_to_conversation(
                     &self.harness.inner,
                     &self.owner_dir,
-                    conversation_id,
-                    Some(session_id),
-                    Some(turn_id),
+                    *conversation_id,
+                    Some(*session_id),
+                    Some(*turn_id),
                     expected_head,
                     data,
                     &mut record,
@@ -1145,26 +1185,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             }
         }
     }
-}
-
-pub(super) async fn snapshot_sandbox_side_effect(
-    harness: &BasicExoHarness,
-    owner_dir: &Path,
-    id: SandboxId,
-    kind: crate::SnapshotKind,
-) -> Result<(SnapshotId, EventData)> {
-    let (done, completion) = futures::channel::oneshot::channel();
-    let owned_harness = harness.clone();
-    let owner_dir = owner_dir.to_path_buf();
-    harness.inner.host.spawn(Box::pin(async move {
-        let result = capture_and_publish_snapshot(&owned_harness, &owner_dir, id, kind).await;
-        if let Err(result) = done.send(result)
-            && let Err(error) = result
-        {
-            tracing::error!(%error, "snapshot publication failed after caller cancellation");
-        }
-    }));
-    completion.await?
 }
 
 async fn capture_and_publish_snapshot(
@@ -1203,8 +1223,8 @@ async fn capture_and_publish_snapshot(
     };
     let snapshot_dir = owner_dir.join("snapshots").join(snapshot_id.to_string());
     let storage = &harness.inner.storage;
-    let result: Result<()> = async {
-        let mut sandbox = load_stored_sandbox(harness, owner_dir, &id).await?;
+    let result: Result<StoredSandbox> = async {
+        let sandbox = load_stored_sandbox(harness, owner_dir, &id).await?;
         if manifest.payload.is_none() {
             storage
                 .put_bytes(snapshot_dir.join("payload.bin"), payload.bytes.to_vec())
@@ -1213,46 +1233,51 @@ async fn capture_and_publish_snapshot(
         storage
             .put_json(snapshot_dir.join("manifest.json"), &manifest)
             .await?;
-        sandbox.latest_snapshot_id = Some(snapshot_id);
-        storage
-            .put_json(
-                owner_dir.join("sandboxes").join(format!("{id}.json")),
-                &sandbox,
-            )
-            .await
+        Ok(sandbox)
     }
     .await;
-    if let Err(error) = result {
-        if is_capture {
-            let cleanup = async {
-                harness
-                    .inner
-                    .sandbox_backend_for_provider(sandbox.provider)
-                    .await?
-                    .delete_snapshot(payload)
-                    .await
+    let mut sandbox = match result {
+        Ok(sandbox) => sandbox,
+        Err(error) => {
+            if is_capture {
+                let cleanup = async {
+                    harness
+                        .inner
+                        .sandbox_backend_for_provider(sandbox.provider)
+                        .await?
+                        .delete_snapshot(payload)
+                        .await
+                }
+                .await;
+                if let Err(cleanup_error) = cleanup {
+                    let error =
+                        error.context(format!("snapshot cleanup failed: {cleanup_error:#}"));
+                    return match storage
+                        .put_json(snapshot_dir.join("manifest.json"), &manifest)
+                        .await
+                    {
+                        Ok(()) => Err(error),
+                        Err(publication_error) => Err(error.context(format!(
+                            "retaining snapshot cleanup reference failed: {publication_error:#}"
+                        ))),
+                    };
+                }
             }
-            .await;
-            if let Err(cleanup_error) = cleanup {
-                let error = error.context(format!("snapshot cleanup failed: {cleanup_error:#}"));
-                return match storage
-                    .put_json(snapshot_dir.join("manifest.json"), &manifest)
-                    .await
-                {
-                    Ok(()) => Err(error),
-                    Err(publication_error) => Err(error.context(format!(
-                        "retaining snapshot cleanup reference failed: {publication_error:#}"
-                    ))),
-                };
+            if let Err(cleanup_error) = storage.delete_prefix(&snapshot_dir).await {
+                return Err(error.context(format!(
+                    "snapshot publication cleanup failed: {cleanup_error:#}"
+                )));
             }
+            return Err(error);
         }
-        if let Err(cleanup_error) = storage.delete_prefix(&snapshot_dir).await {
-            return Err(error.context(format!(
-                "snapshot publication cleanup failed: {cleanup_error:#}"
-            )));
-        }
-        return Err(error);
-    }
+    };
+    sandbox.latest_snapshot_id = Some(snapshot_id);
+    storage
+        .put_json(
+            owner_dir.join("sandboxes").join(format!("{id}.json")),
+            &sandbox,
+        )
+        .await?;
 
     Ok((
         snapshot_id,

@@ -3,11 +3,5 @@
   "env": {
     "builtin": true
   },
-  "ignorePatterns": [
-    ".next/**",
-    "coverage/**",
-    "node_modules/**",
-    "exoharness/cloudflare/dist/**",
-    "exoharness/cloudflare/src/wasm/**"
-  ]
+  "ignorePatterns": [".next/**", "coverage/**", "node_modules/**"]
 }

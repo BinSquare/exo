@@ -1024,6 +1024,7 @@ impl DurableStopFixture {
         let handle = backend
             .egress
             .acquire(
+                crate::egress::AcquisitionMode::Acquire,
                 request.clone(),
                 None,
                 |_| async { Ok(egress_transport.clone() as Arc<dyn EgressTransport>) },

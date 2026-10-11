@@ -2,8 +2,6 @@ use super::super::capture_store;
 use super::super::snapshot_lease::SnapshotLease;
 use super::*;
 use std::fs::{self, File};
-#[cfg(test)]
-use std::os::unix::fs::MetadataExt;
 
 const MAX_ALLOCATED: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_CAPTURE_MOUNTS: usize = 21;
@@ -329,21 +327,8 @@ mod tests {
         fs::create_dir(&source)?;
         crate::local_volume::create_sized_volume(&source, 1)?;
         let workspace = crate::local_volume::mount_volume(&source)?;
-        fs::write(workspace.join("marker"), b"captured")?;
-        let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
-        request.spec.mounts = vec![crate::SandboxMount {
-            host_path: workspace.clone(),
-            guest_path: "/repo".into(),
-            access: SandboxMountAccess::ReadWrite,
-            internal: false,
-        }];
-        let (staging, staging_lease) = staging_directory(root.path())?;
-        fs::write(
-            staging.path().join("machine.smolmachine"),
-            b"unit-test pack",
-        )?;
-        let payload = publish(root.path(), staging, &request)?;
-        drop(staging_lease);
+        let (mut request, payload) =
+            capture_fixture(root.path(), vec![mount(&workspace, "/repo")])?;
         fs::write(workspace.join("marker"), b"later")?;
         let manifest = Manifest::parse(&payload)?;
         let lease = open(root.path(), &manifest)?;
@@ -360,12 +345,10 @@ mod tests {
             mounts.keep();
         }
         request.spec.mounts[0].host_path = workspace.clone();
-        request.spec.mounts.push(crate::SandboxMount {
-            host_path: root.path().join("missing"),
-            guest_path: "/missing".into(),
-            access: SandboxMountAccess::ReadWrite,
-            internal: false,
-        });
+        request
+            .spec
+            .mounts
+            .push(mount(&root.path().join("missing"), "/missing"));
         let mut partial = manifest.clone();
         let mut missing = manifest.volumes[0].clone();
         missing.guest_path = "/missing".into();
@@ -384,22 +367,7 @@ mod tests {
     fn directory_captures_restore_independently_and_hold_deletion_leases() -> Result<()> {
         let root = tempfile::tempdir()?;
         let workspace = root.path().join("source");
-        fs::create_dir(&workspace)?;
-        fs::write(workspace.join("marker"), b"original")?;
-        let (staging, staging_lease) = staging_directory(root.path())?;
-        fs::write(
-            staging.path().join("machine.smolmachine"),
-            b"unit-test pack",
-        )?;
-        let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
-        request.spec.mounts = vec![crate::SandboxMount {
-            host_path: workspace.clone(),
-            guest_path: "/repo".into(),
-            access: SandboxMountAccess::ReadWrite,
-            internal: false,
-        }];
-        let payload = publish(root.path(), staging, &request)?;
-        drop(staging_lease);
+        let (request, payload) = capture_fixture(root.path(), vec![mount(&workspace, "/repo")])?;
         let manifest = Manifest::parse(&payload)?;
         let lease = open(root.path(), &manifest)?;
         fs::write(workspace.join("marker"), b"later")?;
@@ -412,7 +380,7 @@ mod tests {
         restore_mounts(&lease.directory, &manifest, &mut second)?.keep();
         assert_eq!(
             fs::read(second.spec.mounts[0].host_path.join("marker"))?,
-            b"original"
+            b"captured"
         );
         assert!(delete(root.path(), &payload).is_err());
         drop(lease);
@@ -443,23 +411,8 @@ mod tests {
         use std::io::Read;
         let root = tempfile::tempdir()?;
         let shared = root.path().join("shared");
-        fs::create_dir(&shared)?;
-        fs::write(shared.join("marker"), b"captured")?;
-        let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
-        request.spec.mounts = vec![crate::SandboxMount {
-            host_path: shared.clone(),
-            guest_path: "/repo".into(),
-            access: SandboxMountAccess::ReadWrite,
-            internal: false,
-        }];
+        let (mut request, payload) = capture_fixture(root.path(), vec![mount(&shared, "/repo")])?;
         let peer = request.clone();
-        let (staging, staging_lease) = staging_directory(root.path())?;
-        fs::write(
-            staging.path().join("machine.smolmachine"),
-            b"unit-test pack",
-        )?;
-        let payload = publish(root.path(), staging, &request)?;
-        drop(staging_lease);
         fs::write(shared.join("marker"), b"later")?;
         let mut attached = File::open(peer.spec.mounts[0].host_path.join("marker"))?;
         let manifest = Manifest::parse(&payload)?;
@@ -481,9 +434,8 @@ mod tests {
     async fn cancelled_restore_keeps_mounts_and_leases_until_start_finishes() -> Result<()> {
         for succeeds in [true, false] {
             let root = tempfile::tempdir()?;
-            let binary = root.path().join("smolvm");
-            super::super::tests::write_test_binary(
-                &binary,
+            let (backend, request, payload) = restore_fixture(
+                root.path(),
                 &format!(
                     r#"
 root=$(dirname "$0")
@@ -502,31 +454,8 @@ case "$1 $2" in
   *) exit 0;;
 esac"#
                 ),
-            );
-            let backend = SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
-                binary: Some(binary),
-                mode: SmolvmExecutionMode::Warm,
-                snapshot_root: Some(root.path().join("captures")),
-                ..Default::default()
-            });
-            let source = root.path().join("source");
-            fs::create_dir(&source)?;
-            fs::write(source.join("marker"), b"captured")?;
-            let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
-            request.spec.mounts = vec![crate::SandboxMount {
-                host_path: source,
-                guest_path: "/repo".into(),
-                access: SandboxMountAccess::ReadWrite,
-                internal: false,
-            }];
-            let (staging, staging_lease) = staging_directory(&backend.snapshot_root)?;
-            fs::write(staging.path().join("machine.smolmachine"), b"pack")?;
-            let payload = publish(&backend.snapshot_root, staging, &request)?;
-            drop(staging_lease);
-            let target = root.path().join("target");
-            fs::create_dir(&target)?;
-            fs::write(target.join("existing"), b"previous")?;
-            request.spec.mounts[0].host_path = target.clone();
+            )?;
+            let target = request.spec.mounts[0].host_path.clone();
             let restoring = {
                 let backend = backend.clone();
                 let request = request.clone();
@@ -566,58 +495,116 @@ esac"#
         Ok(())
     }
 
-    fn capture_fixture(root: &Path) -> Result<SnapshotPayload> {
-        let request = super::super::tests::test_request(Some(Duration::from_secs(60)));
-        let (staging, _lease) = staging_directory(root)?;
+    fn mount(path: &Path, guest: &str) -> crate::SandboxMount {
+        crate::SandboxMount {
+            host_path: path.to_owned(),
+            guest_path: guest.into(),
+            access: SandboxMountAccess::ReadWrite,
+            internal: false,
+        }
+    }
+
+    fn capture_request(mounts: Vec<crate::SandboxMount>) -> Result<crate::SandboxRequest> {
+        for mount in &mounts {
+            fs::create_dir_all(&mount.host_path)?;
+            fs::write(mount.host_path.join("marker"), b"captured")?;
+        }
+        let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
+        request.spec.mounts = mounts;
+        Ok(request)
+    }
+
+    fn staged_pack(root: &Path) -> Result<(tempfile::TempDir, SnapshotLease)> {
+        let (staging, lease) = staging_directory(root)?;
         fs::write(
             staging.path().join("machine.smolmachine"),
             b"unit-test pack",
         )?;
-        publish(root, staging, &request)
+        Ok((staging, lease))
+    }
+
+    fn capture_fixture(
+        root: &Path,
+        mounts: Vec<crate::SandboxMount>,
+    ) -> Result<(crate::SandboxRequest, SnapshotPayload)> {
+        let request = capture_request(mounts)?;
+        let (staging, _lease) = staged_pack(root)?;
+        let payload = publish(root, staging, &request)?;
+        Ok((request, payload))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn restore_fixture(
+        root: &Path,
+        script: &str,
+    ) -> Result<(SmolvmSandboxBackend, crate::SandboxRequest, SnapshotPayload)> {
+        let binary = root.join("smolvm");
+        super::super::tests::write_test_binary(&binary, script);
+        let backend = SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
+            binary: Some(binary),
+            mode: SmolvmExecutionMode::Warm,
+            snapshot_root: Some(root.join("captures")),
+            ..Default::default()
+        });
+        let (mut request, payload) = capture_fixture(
+            &backend.snapshot_root,
+            vec![mount(&root.join("source"), "/repo")],
+        )?;
+        let target = root.join("target");
+        fs::create_dir(&target)?;
+        fs::write(target.join("existing"), b"previous")?;
+        request.spec.mounts[0].host_path = target;
+        Ok((backend, request, payload))
     }
 
     #[test]
     fn cached_allocations_enforce_the_budget_and_deletion_frees_it() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let payload = capture_fixture(root.path())?;
+        let payload = capture_fixture(root.path(), vec![])?.1;
         let directory = root.path().join(Manifest::parse(&payload)?.key);
         assert_eq!(
             capture_store::retained_allocation(root.path())?,
             capture_store::allocated(&directory)?
         );
         fs::write(directory.join("allocated.bin"), MAX_ALLOCATED.to_le_bytes())?;
-        let error = capture_fixture(root.path()).unwrap_err();
+        let error = capture_fixture(root.path(), vec![]).unwrap_err();
         assert!(error.to_string().contains("budget exhausted"));
         delete(root.path(), &payload)?;
         assert_eq!(capture_store::retained_allocation(root.path())?, 0);
-        capture_fixture(root.path())?;
+        capture_fixture(root.path(), vec![])?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn filesystem_snapshot_allocated_bytes_counts_blocks_and_rejects_missing_captures()
+    async fn filesystem_snapshot_allocated_bytes_uses_cached_total_and_rejects_missing_captures()
     -> Result<()> {
         let root = tempfile::tempdir()?;
         let backend = SmolvmSandboxBackend {
             snapshot_root: root.path().into(),
             ..SmolvmSandboxBackend::new()
         };
-        let payload = capture_fixture(root.path())?;
-        let lease = open(root.path(), &Manifest::parse(&payload)?)?;
-        let pack = File::options()
+        let (staging, staging_lease) = staged_pack(root.path())?;
+        File::options()
             .write(true)
-            .open(lease.directory.join("machine.smolmachine"))?;
-        pack.set_len(1024 * 1024 * 1024)?;
-        pack.sync_all()?;
-        let mut expected = fs::metadata(&lease.directory)?.blocks() * 512;
-        for entry in fs::read_dir(&lease.directory)? {
-            expected += entry?.metadata()?.blocks() * 512;
-        }
+            .open(staging.path().join("machine.smolmachine"))?
+            .set_len(1024 * 1024 * 1024)?;
+        let payload = publish(root.path(), staging, &capture_request(vec![])?)?;
+        drop(staging_lease);
+        let lease = open(root.path(), &Manifest::parse(&payload)?)?;
+        let expected = capture_store::allocated(&lease.directory)?;
+        fs::write(lease.directory.join("unaccounted"), vec![1; 1024 * 1024])?;
         let bytes = backend
             .filesystem_snapshot_allocated_bytes(payload.clone())
             .await?;
         assert_eq!(bytes, expected);
         assert!(bytes > 0 && bytes < 1024 * 1024);
+        fs::write(lease.directory.join("allocated.bin"), b"invalid")?;
+        assert!(
+            backend
+                .filesystem_snapshot_allocated_bytes(payload.clone())
+                .await
+                .is_err()
+        );
         drop(lease);
         backend.delete_snapshot(payload.clone()).await?;
         assert!(
@@ -632,8 +619,8 @@ esac"#
     #[test]
     fn collection_validates_manifest_keys_and_preserves_cataloged_captures() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let kept = capture_fixture(root.path())?;
-        let invalid = capture_fixture(root.path())?;
+        let kept = capture_fixture(root.path(), vec![])?.1;
+        let invalid = capture_fixture(root.path(), vec![])?.1;
         let mut manifest = Manifest::parse(&invalid)?;
         let directory = root.path().join(&manifest.key);
         manifest.key = "../outside".into();
@@ -653,20 +640,8 @@ esac"#
         let root = tempfile::tempdir()?;
         let captures = root.path().join("captures");
         let source = root.path().join("source");
-        fs::create_dir(&source)?;
-        fs::write(source.join("marker"), b"captured")?;
-        let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
-        request.spec.mounts = vec![crate::SandboxMount {
-            host_path: source,
-            guest_path: "/repo".into(),
-            access: SandboxMountAccess::ReadWrite,
-            internal: false,
-        }];
-        let (staging, staging_lease) = staging_directory(&captures)?;
-        fs::write(
-            staging.path().join("machine.smolmachine"),
-            b"unit-test pack",
-        )?;
+        let request = capture_request(vec![mount(&source, "/repo")])?;
+        let (staging, staging_lease) = staged_pack(&captures)?;
         let directory = staging.path().to_owned();
         let budget = capture_store::exclusive_lock(&captures.join("budget.lock"))?;
         let root_for_publish = captures.clone();
@@ -692,43 +667,22 @@ esac"#
     #[test]
     fn partial_mount_restore_removes_its_copies_and_preserves_existing_files() -> Result<()> {
         let root = tempfile::tempdir()?;
-        fs::create_dir(root.path().join("volume-0"))?;
-        fs::write(root.path().join("volume-0/marker"), b"captured")?;
-        let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
+        let (mut request, payload) = capture_fixture(
+            root.path(),
+            vec![
+                mount(&root.path().join("source-first"), "/first"),
+                mount(&root.path().join("source-second"), "/second"),
+            ],
+        )?;
+        let manifest = Manifest::parse(&payload)?;
+        let lease = open(root.path(), &manifest)?;
+        fs::remove_dir_all(lease.directory.join("volume-1"))?;
         let first = root.path().join("first");
         fs::create_dir(&first)?;
         fs::write(first.join("existing"), b"keep")?;
-        request.spec.mounts = vec![
-            crate::SandboxMount {
-                host_path: first.clone(),
-                guest_path: "/first".into(),
-                access: SandboxMountAccess::ReadWrite,
-                internal: false,
-            },
-            crate::SandboxMount {
-                host_path: root.path().join("second"),
-                guest_path: "/second".into(),
-                access: SandboxMountAccess::ReadWrite,
-                internal: false,
-            },
-        ];
-        let manifest = Manifest {
-            key: "a".repeat(32),
-            workdir: request.spec.default_workdir.clone(),
-            volumes: vec![
-                Volume {
-                    guest_path: "/first".into(),
-                    access: SandboxMountAccess::ReadWrite,
-                    apfs: false,
-                },
-                Volume {
-                    guest_path: "/second".into(),
-                    access: SandboxMountAccess::ReadWrite,
-                    apfs: false,
-                },
-            ],
-        };
-        assert!(restore_mounts(root.path(), &manifest, &mut request).is_err());
+        request.spec.mounts[0].host_path = first.clone();
+        request.spec.mounts[1].host_path = root.path().join("second");
+        assert!(restore_mounts(&lease.directory, &manifest, &mut request).is_err());
         assert!(!first.join("marker").exists());
         assert_eq!(fs::read(first.join("existing"))?, b"keep");
         Ok(())
@@ -749,9 +703,8 @@ esac"#
             } else {
                 "exit 0"
             };
-            let binary = root.path().join("smolvm");
-            super::super::tests::write_test_binary(
-                &binary,
+            let (backend, request, payload) = restore_fixture(
+                root.path(),
                 &format!(
                     r#"
 case "$1 $2" in
@@ -766,36 +719,8 @@ case "$1 $2" in
   *) exit 0;;
 esac"#
                 ),
-            );
-            let backend = SmolvmSandboxBackend {
-                snapshot_root: root.path().join("captures"),
-                ..SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
-                    binary: Some(binary),
-                    mode: SmolvmExecutionMode::Warm,
-                    ..Default::default()
-                })
-            };
-            let (staging, _lease) = staging_directory(&backend.snapshot_root)?;
-            fs::write(
-                staging.path().join("machine.smolmachine"),
-                b"unit-test pack",
             )?;
-            let source = root.path().join("source");
-            fs::create_dir(&source)?;
-            fs::write(source.join("marker"), b"captured")?;
-            let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
-            request.spec.mounts = vec![crate::SandboxMount {
-                host_path: source,
-                guest_path: "/repo".into(),
-                access: SandboxMountAccess::ReadWrite,
-                internal: false,
-            }];
-            let payload = publish(&backend.snapshot_root, staging, &request)?;
-            drop(_lease);
-            let target = root.path().join("target");
-            fs::create_dir(&target)?;
-            fs::write(target.join("existing"), b"keep")?;
-            request.spec.mounts[0].host_path = target.clone();
+            let target = request.spec.mounts[0].host_path.clone();
             let error = backend
                 .acquire_from_snapshot(request, payload)
                 .await
@@ -816,7 +741,7 @@ esac"#
                 "{message}"
             );
             assert!(!target.join("marker").exists());
-            assert_eq!(fs::read(target.join("existing"))?, b"keep");
+            assert_eq!(fs::read(target.join("existing"))?, b"previous");
         }
         Ok(())
     }

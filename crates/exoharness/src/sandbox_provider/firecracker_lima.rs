@@ -344,6 +344,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         let terminate = self.terminate_request(request.clone());
         self.egress
             .acquire(
+                crate::egress::AcquisitionMode::Acquire,
                 request.clone(),
                 self.external_proxy.as_ref(),
                 |policy| async move { self.egress_transport(&policy).await },
@@ -465,7 +466,8 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         }
         let terminate = self.terminate_request(request.clone());
         self.egress
-            .restore(
+            .acquire(
+                crate::egress::AcquisitionMode::Restore,
                 request.clone(),
                 self.external_proxy.as_ref(),
                 |policy| async move { self.egress_transport(&policy).await },
@@ -1958,6 +1960,7 @@ mod egress_cleanup_tests {
         let runtime = EgressRuntime::new(None, Arc::new(PublicUpstreamResolver));
         let handle = runtime
             .acquire(
+                crate::egress::AcquisitionMode::Acquire,
                 request.clone(),
                 None,
                 |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },

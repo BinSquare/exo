@@ -151,6 +151,12 @@ struct CachedSandbox<H, P> {
     egress: Arc<SandboxEgress<P>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcquisitionMode {
+    Acquire,
+    Restore,
+}
+
 // Shared acquisition logic for native sandbox egress.
 // This owns cached handles/proxies, not VM execution or the secret store.
 // A hosted backend can own its own allocation lifecycle instead of using this.
@@ -211,45 +217,9 @@ impl<H: ManagedSandboxHandle + 'static, P: SandboxProxy> EgressRuntime<H, P> {
     // both backends share cache checks and cleanup without a second VM wrapper.
     pub(crate) async fn acquire_with_proxy<T, TF, B, BF>(
         &self,
+        mode: AcquisitionMode,
         request: SandboxRequest,
         external_proxy: Option<&super::ExternalProxyConfig>,
-        proxy: T,
-        build: B,
-        terminate: impl Future<Output = Result<()>>,
-    ) -> Result<Arc<H>>
-    where
-        T: FnOnce(State, CancellationToken) -> TF,
-        TF: Future<Output = Result<P>>,
-        B: FnOnce(Option<Arc<SandboxEgress<P>>>) -> BF,
-        BF: Future<Output = Result<H>>,
-    {
-        self.acquire_with_proxy_inner(request, external_proxy, true, proxy, build, terminate)
-            .await
-    }
-
-    pub(crate) async fn restore_with_proxy<T, TF, B, BF>(
-        &self,
-        request: SandboxRequest,
-        external_proxy: Option<&super::ExternalProxyConfig>,
-        proxy: T,
-        build: B,
-        terminate: impl Future<Output = Result<()>>,
-    ) -> Result<Arc<H>>
-    where
-        T: FnOnce(State, CancellationToken) -> TF,
-        TF: Future<Output = Result<P>>,
-        B: FnOnce(Option<Arc<SandboxEgress<P>>>) -> BF,
-        BF: Future<Output = Result<H>>,
-    {
-        self.acquire_with_proxy_inner(request, external_proxy, false, proxy, build, terminate)
-            .await
-    }
-
-    async fn acquire_with_proxy_inner<T, TF, B, BF>(
-        &self,
-        request: SandboxRequest,
-        external_proxy: Option<&super::ExternalProxyConfig>,
-        reuse: bool,
         proxy: T,
         build: B,
         terminate: impl Future<Output = Result<()>>,
@@ -277,7 +247,10 @@ impl<H: ManagedSandboxHandle + 'static, P: SandboxProxy> EgressRuntime<H, P> {
                 && egress.is_open()
                 && handle.is_running().await? == Some(true)
             {
-                ensure!(reuse, "snapshot restore target already has an allocation");
+                ensure!(
+                    mode == AcquisitionMode::Acquire,
+                    "snapshot restore target already has an allocation"
+                );
                 ensure!(
                     unchanged,
                     "stop the protected sandbox before changing its configuration"
@@ -350,7 +323,7 @@ impl<H: ManagedSandboxHandle + 'static, P: SandboxProxy> EgressRuntime<H, P> {
             if let Err(cleanup) = egress.proxy.shutdown().await {
                 tracing::warn!(sandbox_id = %request.sandbox_id, %cleanup, "egress cleanup after failed acquisition");
             }
-            if (reuse || built)
+            if (mode == AcquisitionMode::Acquire || built)
                 && let Err(cleanup) = terminate.await
             {
                 tracing::warn!(sandbox_id = %request.sandbox_id, %cleanup, "sandbox cleanup after failed acquisition");
@@ -405,6 +378,7 @@ impl<H: ManagedSandboxHandle + 'static, P: SandboxProxy> EgressRuntime<H, P> {
 impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
     pub(crate) async fn acquire<T, TF, B, BF>(
         &self,
+        mode: AcquisitionMode,
         request: SandboxRequest,
         external_proxy: Option<&super::ExternalProxyConfig>,
         transport: T,
@@ -419,36 +393,9 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
     {
         let policy = request.spec.policy.networking.clone();
         self.acquire_with_proxy(
+            mode,
             request,
             external_proxy,
-            |state, cancel| async move {
-                EgressProxy::start_with_transport(transport(policy).await?, state, cancel).await
-            },
-            build,
-            terminate,
-        )
-        .await
-    }
-    #[cfg(feature = "firecracker")]
-    pub(crate) async fn restore<T, TF, B, BF>(
-        &self,
-        request: SandboxRequest,
-        external_proxy: Option<&super::ExternalProxyConfig>,
-        transport: T,
-        build: B,
-        terminate: impl Future<Output = Result<()>>,
-    ) -> Result<Arc<H>>
-    where
-        T: FnOnce(crate::SandboxNetworkPolicy) -> TF,
-        TF: Future<Output = Result<Arc<dyn EgressTransport>>>,
-        B: FnOnce(Option<Arc<SandboxEgress>>) -> BF,
-        BF: Future<Output = Result<H>>,
-    {
-        let policy = request.spec.policy.networking.clone();
-        self.acquire_with_proxy_inner(
-            request,
-            external_proxy,
-            false,
             |state, cancel| async move {
                 EgressProxy::start_with_transport(transport(policy).await?, state, cancel).await
             },
@@ -573,6 +520,7 @@ mod tests {
         let transport = Arc::new(Transport::default());
         runtime
             .acquire(
+                AcquisitionMode::Acquire,
                 request("one"),
                 None,
                 |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
@@ -581,7 +529,8 @@ mod tests {
             )
             .await?;
         let result = runtime
-            .restore(
+            .acquire(
+                AcquisitionMode::Restore,
                 request("one"),
                 None,
                 |_| async { panic!("restore must not replace the existing proxy") },
@@ -610,7 +559,8 @@ mod tests {
             let transport = Arc::new(Transport::default());
             let terminated = AtomicBool::new(false);
             let result = runtime
-                .restore(
+                .acquire(
+                    AcquisitionMode::Restore,
                     request("one"),
                     None,
                     |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
@@ -653,6 +603,7 @@ mod tests {
         let transport = Arc::new(Transport::default());
         runtime
             .acquire(
+                AcquisitionMode::Acquire,
                 request("one"),
                 None,
                 |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
@@ -683,6 +634,7 @@ mod tests {
             let running = AtomicBool::new(false);
             let result = runtime
                 .acquire(
+                    AcquisitionMode::Acquire,
                     request("one"),
                     None,
                     |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
@@ -710,6 +662,7 @@ mod tests {
             let replacement = Arc::new(Transport::default());
             runtime
                 .acquire(
+                    AcquisitionMode::Acquire,
                     request("one"),
                     None,
                     |_| async { Ok(replacement.clone() as Arc<dyn EgressTransport>) },
@@ -731,6 +684,7 @@ mod tests {
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let acquiring = runtime.acquire(
+            AcquisitionMode::Acquire,
             request("one"),
             None,
             |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
@@ -765,6 +719,7 @@ mod tests {
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let acquiring = runtime.acquire(
+            AcquisitionMode::Acquire,
             request("one"),
             None,
             |_| async {
@@ -794,6 +749,7 @@ mod tests {
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let acquiring = runtime.acquire(
+            AcquisitionMode::Acquire,
             request("one"),
             None,
             |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
@@ -831,6 +787,7 @@ mod tests {
             let old = Arc::new(Transport::default());
             let retained = runtime
                 .acquire(
+                    AcquisitionMode::Acquire,
                     request("one"),
                     None,
                     |_| async { Ok(old.clone() as Arc<dyn EgressTransport>) },
@@ -843,6 +800,7 @@ mod tests {
             let new = Arc::new(Transport::default());
             let replacement = runtime
                 .acquire(
+                    AcquisitionMode::Acquire,
                     changed,
                     None,
                     |_| async {

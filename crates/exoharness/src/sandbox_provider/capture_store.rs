@@ -188,6 +188,18 @@ pub(super) fn record_allocation(directory: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+pub(super) fn cached_allocation(directory: &Path) -> std::io::Result<u64> {
+    let allocation: [u8; 8] = fs::read(directory.join("allocated.bin"))?
+        .try_into()
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid capture allocation total",
+            )
+        })?;
+    Ok(u64::from_le_bytes(allocation))
+}
+
 pub(super) fn retained_allocation(root: &Path) -> Result<u64> {
     let mut bytes = 0u64;
     for directory in directories(root)? {
@@ -198,16 +210,13 @@ pub(super) fn retained_allocation(root: &Path) -> Result<u64> {
         {
             continue;
         }
-        let allocation = match fs::read(directory.join("allocated.bin")) {
+        let allocation = match cached_allocation(&directory) {
             Ok(allocation) => allocation,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
-        let allocation: [u8; 8] = allocation
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid capture allocation total"))?;
         bytes = bytes
-            .checked_add(u64::from_le_bytes(allocation))
+            .checked_add(allocation)
             .context("snapshot size overflow")?;
     }
     Ok(bytes)

@@ -190,7 +190,7 @@ impl SmolvmSandboxBackend {
         tokio::task::spawn_blocking(move || {
             let manifest = filesystem::Manifest::parse(&payload)?;
             let lease = filesystem::open(&root, &manifest)?;
-            super::capture_store::allocated(&lease.directory)
+            Ok(super::capture_store::cached_allocation(&lease.directory)?)
         })
         .await?
     }
@@ -672,7 +672,8 @@ impl SmolvmSandboxBackend {
         let mut restored_mounts = None;
         let handle = self
             .egress
-            .restore_with_proxy(
+            .acquire_with_proxy(
+                crate::egress::AcquisitionMode::Restore,
                 request.clone(),
                 self.external_proxy.as_ref(),
                 SmolvmProxy::start,
@@ -1009,6 +1010,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         let handle = self
             .egress
             .acquire_with_proxy(
+                crate::egress::AcquisitionMode::Acquire,
                 request.clone(),
                 self.external_proxy.as_ref(),
                 SmolvmProxy::start,
