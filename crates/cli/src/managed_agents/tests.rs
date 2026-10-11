@@ -13,7 +13,57 @@ use tempfile::TempDir;
 
 use super::*;
 
-const SOURCE: &str = "---\nname: support-analyst\nharness: basic\nconfig:\n  model: gpt-5.4\n  credential: test-openai\n---\n\nInvestigate support tickets.\n";
+const SOURCE: &str = "---\nharness: basic\nmodel:\n  name: gpt-5.4\n  credential: test-openai\n---\n\nInvestigate support tickets.\n";
+
+#[test]
+fn agent_identity_uses_explicit_name_then_frontmatter_then_filename() -> Result<()> {
+    let temp = TempDir::new()?;
+    let file = temp.path().join("support-analyst.md");
+    std::fs::write(&file, SOURCE)?;
+    let mut definition = AgentDefinition::load(&file)?;
+    for (frontmatter, name, slug, expected) in [
+        (None, None, None, ("support-analyst", "support-analyst")),
+        (
+            Some("Support desk"),
+            None,
+            None,
+            ("Support desk", "support-desk"),
+        ),
+        (
+            Some("Support desk"),
+            Some("My agent"),
+            None,
+            ("My agent", "my-agent"),
+        ),
+        (
+            Some("Support desk"),
+            Some("My agent"),
+            Some("triage"),
+            ("My agent", "triage"),
+        ),
+    ] {
+        definition.frontmatter.name = frontmatter.map(str::to_owned);
+        let args = AgentNameArgs {
+            name: name.map(str::to_owned),
+            slug: slug.map(str::to_owned),
+        };
+        assert_eq!(
+            args.resolve(&definition)?,
+            (expected.0.into(), expected.1.into())
+        );
+    }
+    for name in ["", "   ", "!!!"] {
+        assert!(
+            AgentNameArgs {
+                name: Some(name.into()),
+                ..Default::default()
+            }
+            .resolve(&definition)
+            .is_err()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 struct RecordingModel {
@@ -100,6 +150,7 @@ fn configured_runtime(
     args: &ThreadArgs,
 ) -> Result<Runtime> {
     let setup = executor::managed_agents::LocalAgentSetup {
+        harness: None,
         agent: definition
             .map(|definition| local_agent_config(definition, &harness_selection(definition)?, None))
             .transpose()?,
@@ -130,9 +181,9 @@ async fn open_configured_thread(
 
 fn thread_args(agent: &str) -> ThreadArgs {
     ThreadArgs {
+        identity: AgentNameArgs::default(),
         environment: None,
         environment_file: None,
-        agent_file: None,
         agent: Some(agent.to_string()),
         thread: None,
         model: None,
@@ -153,10 +204,12 @@ async fn saved_definition_and_turn_history_survive_reopening_without_source() ->
     let model = Arc::new(RecordingModel::default());
     let storage_root = temp.path().join("state");
     let runtime = harness(&storage_root, Arc::clone(&model)).await?;
-    let saved = runtime.create_managed_agent(&definition, "support").await?;
+    let saved = runtime
+        .create_managed_agent(&definition, "support", "support")
+        .await?;
     assert!(
         runtime
-            .create_managed_agent(&definition, "support")
+            .create_managed_agent(&definition, "support", "support")
             .await
             .is_err()
     );
@@ -222,7 +275,7 @@ async fn saved_definition_and_turn_history_survive_reopening_without_source() ->
     for request in requests.iter() {
         assert!(
             matches!(&request.messages[0], Message::System { content: UserContent::String(text) }
-            if text == "You are support-analyst.\n\nInvestigate support tickets.")
+            if text == "Investigate support tickets.")
         );
     }
     assert!(requests[1].messages.iter().any(|message| matches!(message,
@@ -242,14 +295,18 @@ async fn file_runs_reuse_saved_agents_and_mounts_stay_on_threads() -> Result<()>
     std::fs::write(&path, SOURCE)?;
     let definition = AgentDefinition::load(&path)?;
     let mut args = thread_args("unused");
-    args.agent = None;
-    args.agent_file = Some(path);
+    args.agent = Some(path.to_string_lossy().into_owned());
     args.mounts.push(
         crate::parse_sandbox_mount(&format!("{}:/workspace/tickets:ro", temp.path().display()))
             .unwrap(),
     );
+    let synced = super::open_agent(runtime.as_ref(), Some(&definition), &args).await?;
+    assert!(managed::list_threads(synced.as_ref()).await?.is_empty());
     let (first, thread) =
         open_configured_thread(runtime.as_ref(), Some(&definition), &args).await?;
+    assert_eq!(first.record().name, "agent");
+    assert_eq!(first.record().slug, "agent");
+    assert_eq!(first.record().id, synced.record().id);
     let (second, second_thread) =
         open_configured_thread(runtime.as_ref(), Some(&definition), &args).await?;
     assert_eq!(first.record().id, second.record().id);
@@ -304,16 +361,15 @@ async fn model_names_pass_through_without_registration_or_substitution() -> Resu
     )
     .await?;
     let path = temp.path().join("agent.md");
-    std::fs::write(&path, SOURCE.replace("gpt-5.4", "gpt-5.6-sol"))?;
+    std::fs::write(&path, SOURCE.replace("gpt-5.4", "gpt-6.1-sol"))?;
     let definition = AgentDefinition::load(&path)?;
     let mut args = thread_args("unused");
-    args.agent = None;
-    args.agent_file = Some(path);
+    args.agent = Some(path.to_string_lossy().into_owned());
     let (agent, thread) =
         open_configured_thread(runtime.as_ref(), Some(&definition), &args).await?;
     assert_eq!(
         executor::load_agent_config(agent.as_ref()).await?.model,
-        "gpt-5.6-sol"
+        "gpt-6.1-sol"
     );
     assert!(
         executor::get_conversation_model_override(thread.as_ref())
@@ -330,7 +386,6 @@ async fn model_names_pass_through_without_registration_or_substitution() -> Resu
         "another-model"
     );
     args.model = None;
-    args.agent_file = None;
     args.agent = Some(agent.record().id.to_string());
     let (_, saved) = open_configured_thread(runtime.as_ref(), None, &args).await?;
     assert!(

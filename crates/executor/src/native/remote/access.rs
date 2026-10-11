@@ -164,7 +164,9 @@ impl AccessPolicy for Policy {
             .get(&record.id)
             .is_some_and(|owner| owner == principal);
         if record.id == self.store.vault_id()
-            || (!owns && (write || !state.shared_vaults.contains(&record.id)))
+            || (!owns
+                && (write
+                    || (record.name != "global" && !state.shared_vaults.contains(&record.id))))
         {
             return Ok(None);
         }

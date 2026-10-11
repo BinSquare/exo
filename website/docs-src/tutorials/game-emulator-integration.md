@@ -5,17 +5,17 @@ description: Wire an agent up to a game or any external stateful system with a s
 
 # Game & Third-Party Tool Integration
 
-![An exo agent playing Pokemon Red, watched live in the sidecar's /view page](/images/gameboy-agent-view.png)
+![An Exo agent playing Pokemon Red, watched live in the sidecar's /view page](/images/gameboy-agent-view.png)
 
 This tutorial shows how to connect an agent built in the exoharness framework to an external system, with the motivating example being a Game Boy playing Pokemon Red.
 
 The finished code is in [`exoharness/examples/gameboy-agent`](https://github.com/exoharness/exo/tree/main/exoharness/examples/gameboy-agent): a ~200-line Python sidecar, a ~100-line TypeScript client, five tools, and a
-~90-line exo harness.
+~90-line Exo harness.
 
-![Architecture: the model talks to the exo turn loop and harness, which drives the emulator sidecar over localhost HTTP](/images/gameboy-agent-architecture.svg)
+![Architecture: the model talks to the Exo turn loop and harness, which drives the emulator sidecar over localhost HTTP](/images/gameboy-agent-architecture.svg)
 
-This builds directly on the [Custom Agent Quickstart](./write-your-own-agent);
-if you haven't written an exo harness before, start there.
+This builds directly on the [Custom harness](write-your-own-agent);
+if you haven't written an Exo harness before, start there.
 
 ## Step 1: Running the emulator
 
@@ -133,7 +133,7 @@ into the compact text block that tool results and the prompt both use
 ## Step 3: Exposing the client via tooling
 
 [`agent/game-tools.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/agent/game-tools.ts)
-turns the client into exo `Tool` objects — a strict-schema `definition` the
+turns the client into Exo `Tool` objects — a strict-schema `definition` the
 model sees, and an `initialize()` returning the handler that runs when the
 model calls it. Here is the main one in full:
 
@@ -211,7 +211,7 @@ accumulate in history (next step).
 ## Step 4: Constructing the agent
 
 [`agent/harness.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/agent/harness.ts)
-is the whole agent policy written as an exoharness typescript executor.
+is the whole agent policy written as an exoharness TypeScript harness.
 
 ```ts
 import {
@@ -279,7 +279,7 @@ The `instructions` hook is where the logic to provide screenshots: it fetches th
 
 ## Step 5: Running the agent
 
-Now, to run our system, there are two processes of interest: the emulator sidecar, and exo driving turns against it.
+Now, to run our system, there are two processes of interest: the emulator sidecar, and Exo driving turns against it.
 [`run.sh`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/run.sh) starts the sidecar (a venv with PyBoy is created on first run):
 
 ```bash
@@ -313,23 +313,22 @@ exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin 
 
 cat > gameboy.md <<'EOF'
 ---
-name: "Gameboy"
 harness: exoharness/examples/gameboy-agent/agent/harness.ts
-config:
-  model: gpt-5.5
+model:
+  name: gpt-6.1-sol
   credential: openai
   max_tool_round_trips: 20
 ---
 Help the user with their task.
 EOF
-exo agent create gameboy --file gameboy.md
+exo agent create gameboy.md
 exo thread create gameboy "Play Pokemon"      # once
 
 exo thread send gameboy play-pokemon \
   "Play Pokemon Red. Get through the intro and pick a starter."
 ```
 
-Each `send` runs one exo turn — the model presses buttons until it reaches a
+Each `send` runs one Exo turn — the model presses buttons until it reaches a
 stopping point (or the round-trip cap), its summary lands in the
 conversation, and the full turn transcript prints. Send again to continue;
 prior summaries are already in history. To just let it play, iterate:
@@ -377,7 +376,7 @@ entirely on its own.
 
 ## Appendix: extending an existing agent instead
 
-Everything above builds a **new** agent executor: `harness.ts` is its own
+Everything above builds a **new** agent harness: `harness.ts` is its own
 module, registered with `agent create`. But the harness contract — hooks
 that return data (message lists, tool registrations) — means you can also
 graft the game layer onto an agent you already run, by composition. The
@@ -394,7 +393,7 @@ import {
 } from "@exo/harness";
 
 import { runResponsesHarnessTurn } from "@exo/model-runtime/turn-loop";
-import { exoInstructions, registerExoTools } from "../../exo/harness";
+import { exoInstructions, registerExoTools } from "../../../../exo/harness";
 import { EmulatorClient, describeState } from "./emulator-client";
 import { gameboyTools } from "./game-tools";
 
@@ -440,5 +439,5 @@ export default defineHarness({
 Point your **existing** agent record at the wrapper and it keeps its memory,
 artifacts, skills, and every conversation — it just gains a live view of the emulator, and tooling to press buttons:
 
-Edit `config.module` in the Exo agent spec, then apply it with
-`exo agent update exo --file exo.md`. Start a new thread after changing harnesses.
+Set `harness` to the wrapper module path in the agent definition, then apply it
+with `exo agent update exo.md`. You can continue the existing thread.

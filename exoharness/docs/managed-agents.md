@@ -5,10 +5,9 @@ Agents use Exo's local state and sandbox providers.
 
 ```markdown
 ---
-name: support-analyst
 harness: codex
-config:
-  model: gpt-5.6-sol
+model:
+  name: gpt-6.1-sol
   credential: openai
 ---
 
@@ -17,7 +16,7 @@ Read the available evidence, cite the tickets behind each finding, and
 write your report to a file.
 ```
 
-`name`, `harness`, and `config.model` are required. The body supplies the agent's
+`harness` and `model.name` are required. The body supplies the agent's
 instructions. Unsupported fields are rejected so a typo or an unimplemented
 feature doesn't silently change how the agent runs.
 
@@ -33,7 +32,7 @@ Resource commands use `create`, `list`, `get`, `update`, and `delete` where supp
 | `agent mount`, `thread mount`                | `create`, `list`, `delete`                  |
 | `environment provider`                       | `create`, `list`                            |
 
-Use `exo thread list AGENT` to list saved chats and `exo agent run --agent AGENT --thread THREAD`
+Use `exo thread list AGENT` to list saved chats and `exo run AGENT --thread THREAD`
 to resume one. Environments are reusable configurations; agents and threads manage
 the running instances. Runtime-specific scope belongs in the provider URL. Exo preserves its path
 and query parameters without interpreting them.
@@ -61,14 +60,14 @@ exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin 
 ```
 
 `OPENAI_API_KEY` must already be set. `--token-env` takes the variable's name.
-Set `config.model` to the upstream model name and `config.credential` to a secret
-name or ID in a selected vault. Set `config.base_url` for a custom endpoint.
+Set `model.name` to the upstream model name and `model.credential` to a secret
+name or ID in a selected vault. Set `model.base_url` for a custom endpoint.
 There is no model registration or fallback to another model. `--model` overrides
 the model name for the thread and keeps its credential and endpoint.
 
 Codex, Claude Code, and Pi use digest-pinned devbox images by default. To develop
 the Codex image locally, build it and set
-`config.image: exo-codex-devbox:latest` in an environment definition:
+`image: exo-codex-devbox:latest` in an environment definition:
 
 ```bash
 docker build --build-arg DEVBOX_TOOLS=true -t exo-codex-devbox:latest \
@@ -89,7 +88,7 @@ See [coding agent harnesses](coding-agent-harnesses.md) for other harness setup.
 
 ## Run it
 
-`exo agent run` runs inline and leaves the conversation in your terminal scrollback.
+`exo run` runs inline and leaves the conversation in your terminal scrollback.
 Use `--tui` to opt into the full-screen interface. Type `/help` for commands or
 `/exit` to quit.
 
@@ -102,39 +101,38 @@ Declare guest TCP ports in the environment:
 
 ```yaml
 name: dev
-config:
-  image: my-dev-image
-  tcp_ports: [5173, 8000]
+image: my-dev-image
+tcp_ports: [5173, 8000]
 ```
 
-`exo agent run` prints a services page such as
+`exo run` prints a services page such as
 `http://my-project-<id>.localhost:<port>` and one service URL per declared port:
 `http://5173.my-project-<id>.localhost:<port>`. Exo gives the same URLs to the agent
 for browser API URLs and CORS. `.localhost` resolves to loopback in browsers.
 HTTP and WebSocket traffic passes through unchanged.
 
-Keep an inline CLI session open to use its previews. `exo serve` shares one
+Keep an inline CLI session open to use its previews. `exo run --serve` shares one
 preview listener across its threads and keeps it open when clients exit.
 Both modes reuse the saved listener port when available; a collision selects
 and saves a new port, so use the newly printed URLs. `exo thread ports AGENT THREAD`
 shows the active owner's URLs without starting a VM.
 
-For a remote server, set `exo serve --preview-domain DOMAIN` to a DNS suffix
+For a remote server, set `exo run --serve --preview-domain DOMAIN` to a DNS suffix
 resolving to your tunnel and forward the printed port with
 `ssh -L PORT:127.0.0.1:PORT SERVER`. Preview listeners bind to `127.0.0.1` and use HTTP.
 
 A `502` means the sandbox or service is unavailable. Start it and check its logs.
 If the UI works but API or WebSocket requests fail, configure their browser URLs
 and allow the full frontend origin in CORS, including the port.
-For other TCP protocols, use `exo thread sandbox forward AGENT THREAD --port PORT`;
+For other TCP protocols, use `exo sandbox forward AGENT THREAD --port PORT`;
 `--bind 127.0.0.1:LOCAL_PORT` selects the local port, and Ctrl-C stops forwarding.
 
 ### Named agents and threads
 
 ```bash
-exo agent run --agent-file exoharness/examples/managed-agents/support-analyst.md
+exo run exoharness/examples/managed-agents/support-analyst.md
 
-exo agent run --agent-file exoharness/examples/managed-agents/support-analyst.md \
+exo run exoharness/examples/managed-agents/support-analyst.md \
   --mount ./tickets:/workspace/tickets:ro \
   --mount ./reports:/workspace/reports:rw \
   --prompt "Analyze the tickets in /workspace/tickets and save /workspace/reports/report.md"
@@ -147,11 +145,11 @@ so the same agent can run in different environments.
 To save an agent under a name:
 
 ```bash
-exo agent create support --file exoharness/examples/managed-agents/support-analyst.md
+exo agent create exoharness/examples/managed-agents/support-analyst.md --name support
 exo agent list
-exo agent run --agent support
+exo run support
 exo thread list support
-exo agent run --agent support --thread my-project
+exo run support --thread my-project
 ```
 
 The CLI prints the agent and thread ids. Both ids and slugs work when resuming.
@@ -167,9 +165,9 @@ thread.
 Select VM settings explicitly with `--environment NAME`:
 
 ```bash
-exo agent create support --file agent.md
+exo agent create agent.md --name support
 exo environment create local-dev --file environment.yaml
-exo agent run --agent support --environment local-dev --thread my-project
+exo run support --environment local-dev --thread my-project
 ```
 
 The environment file's `name` must match the name passed to `environment create`.
@@ -181,7 +179,7 @@ Direct local CLI sessions stop their managed thread sandboxes when the session
 exits. With SmolVM, resuming the thread restarts the same VM with its disks and
 chat retained. Processes inside the VM restart; a development stack needs its
 startup command on resume. Deleting the thread removes its managed VM and disks.
-HTTP clients leave sandbox lifetime with the server, so use `exo serve` when
+HTTP clients leave sandbox lifetime with the server, so use `exo run --serve` when
 services should stay running between client sessions.
 
 Local commands and servers claim exclusive ownership of each thread they use.
@@ -189,16 +187,17 @@ Other threads can run concurrently under the same state root. Use the owner's
 HTTP provider to execute, reconfigure or delete a server-owned thread. Read-only
 queries and port forwarding do not claim ownership. After a crash, the next owner
 stops leftover managed sandboxes before resuming. Attached sandboxes keep their
-external owner. One `exo serve` process may supervise adapters per state root.
+external owner. One `exo run --serve` process may supervise adapters per state root.
 
-Each `--agent-file` invocation creates or updates a saved agent from the Markdown
-file, then starts a saved thread. The agent slug combines the filename with a hash
-of its canonical absolute path; rerunning the same file reuses the agent and
-replaces its saved definition. Moving the file creates a different agent. Add
+Each `exo run FILE.md` invocation creates or updates a saved agent from the Markdown
+file, then starts a saved thread. The name comes from `--name`, optional frontmatter
+`name:`, then the filename without `.md`. The slug derives from the name, or uses
+`--slug` when supplied. Rerunning a file with the same slug reuses the agent and
+replaces its saved definition. Add
 `--thread <slug>` to resume a saved thread. Agents and history remain until deleted.
 
-Use `exo agent create` to save an agent with an explicit name and `exo agent run
---agent` to run it without syncing a file. Named creation rejects an existing name.
+Use `exo agent create FILE.md` to save an agent and `exo run NAME` to run it without syncing a file. Creation rejects an existing slug;
+`exo agent update FILE.md` requires an existing agent. Both use the same name and slug rules as `run`.
 Editing or deleting the source Markdown has no effect until it is synced again. `--model` overrides the model for a thread;
 `--harness` can override the harness when loading a file. Saved agents keep their
 harness.
@@ -211,14 +210,14 @@ must be installed on the provider; the spec does not bundle their code.
 
 ## Specs and credentials
 
-`exo agent update NAME --file agent.md` replaces the saved spec. It preserves
+`exo agent update agent.md --name NAME` replaces the saved spec. It preserves
 threads and restores the previous spec if the provider rejects the update.
 `exo agent get NAME` shows the saved spec and resolved harness configuration.
 
 Declare TypeScript tool modules in `tools: [./tools.ts]`; their paths follow the
-same resolution rules as harness modules. Optional `config.braintrust` retains
+same resolution rules as harness modules. Optional `model.braintrust` retains
 tracing settings (`org_name` and `project: {kind: name, value: PROJECT}`). `tool_creation: true` enables the
-harness's agent-authored tool support. For `harness: exo`, set `config.module`
+harness's agent-authored tool support. For `harness: exo`, set `model.module`
 to the Exo harness module. Sandbox configuration, including the image, belongs
 in an environment definition, not the agent file.
 
@@ -227,8 +226,7 @@ The agent spec selects its model and vault credential. Attach a vault with
 secrets in earlier attachments, including `global`. Sandbox provider bindings
 accept `--vault team --secret KEY` under `exo environment provider create --backend BACKEND`.
 
-Pricing, harness, and egress overrides belong on `agent run`, `thread send`, or
-`serve`; configuration and vault commands do not accept them. Use `--env-file FILE`
+Pricing, harness, and egress overrides belong on `run` or `thread send`; configuration and vault commands do not accept them. Use `--env-file FILE`
 to load environment variables explicitly; a missing file is an error.
 
 ## Serve over HTTP
@@ -237,22 +235,22 @@ See the [remote server plan](design/remote-server.md) for personal/team login,
 vault ownership, multiplayer sharing, and the web UI.
 
 ```sh
-exo serve --agent support --bind 127.0.0.1:8080
+exo run support --serve --bind 127.0.0.1:8080
 # In another terminal:
 exo provider create served --url http://127.0.0.1:8080/exo
-exo --provider served agent run --agent support --prompt "Summarize today's tickets"
+exo --provider served run support --prompt "Summarize today's tickets"
 ```
 
 The server uses the existing managed-agent HTTP API: agent discovery, saved
 threads, turns, event streaming, cancellation, approval responses, and reconnect.
 `GET /exo/agent/{agent_id}/thread/{thread_id}/previews` returns the server's
 `{domain, port}` preview address, or `null` when previews are unavailable.
-With `--agent NAME`, only that agent is visible and other agents are inaccessible.
-Omit `--agent` to serve the local provider, including agent creation. This does not expose the raw ExoHarness `/request` transport.
+With `exo run NAME --serve`, only that agent is visible and other agents are inaccessible.
+Omit the agent argument to serve the local provider, including agent creation. This does not expose the raw ExoHarness `/request` transport.
 
 Declare adapter attachment names in the agent spec, for example
 `adapters: [support-slack]`. Pass deployment definitions as
-`exo serve --agent support --adapters-file adapters.yaml`.
+`exo run support --serve --adapters-file adapters.yaml`.
 Each YAML key is an attachment name; its value is an `AdapterConfig` with
 `adapterType`, `workerCommand`, optional `initialization`, `stateDir`, and
 `secretEnv: [{env: SLACK_BOT_TOKEN, vault: team, secretId: slack-token}]`.
@@ -294,7 +292,7 @@ mcp_servers:
 DeepWiki doesn't need credentials. Try the example:
 
 ```bash
-exo agent run --agent-file exoharness/examples/managed-agents/repo-analyst.md \
+exo run exoharness/examples/managed-agents/repo-analyst.md \
   --prompt "Use DeepWiki to explain how tokio-rs/tokio schedules tasks."
 ```
 
@@ -370,18 +368,18 @@ name; each new thread gets its own sandbox:
 exo environment create pi-local --file exoharness/examples/environments/pi-local.yaml
 exo environment list
 exo environment get pi-local
-exo agent run --agent-file exoharness/examples/managed-agents/pi-assistant.md \
+exo run exoharness/examples/managed-agents/pi-assistant.md \
   --environment pi-local
 ```
 
-The example uses Apple container. Change `config.provider` to `docker` on Linux.
-`config.image` names the container image (a tag or digest). With SmolVM on macOS,
+The example uses Apple container. Change `provider` to `docker` on Linux.
+`image` names the container image (a tag or digest). With SmolVM on macOS,
 Exo imports matching images from the local Docker store into its private cache;
 registry images are handled by SmolVM. You do not need to export an archive.
 Building an image remains a separate step from selecting it in the environment.
 The Codex example at `exoharness/examples/environments/codex-smolvm.yaml` uses
 the published `ghcr.io/exoharness/codex-devbox:latest`. To use a locally built
-image instead, change its `config.image` to `exo-codex-devbox:latest`.
+image instead, change its `image` to `exo-codex-devbox:latest`.
 Definitions forward the existing sandbox settings: `provider`, `image`,
 `resources`, `default_workdir`, `file_system_mounts`, `durable_file_systems`, `tcp_ports`, `policy`,
 `enable_networking`, and `idle_seconds`. `policy.networking` takes precedence over
@@ -413,7 +411,7 @@ mounting host paths, and local-process execution. Give it only to trusted runtim
 operators.
 
 `exo environment update NAME --file path.yaml` changes the saved definition for
-new threads. Resume with `--agent NAME --thread THREAD --environment NAME` or
+new threads. Resume with `exo run NAME --thread THREAD --environment NAME` or
 `--environment-file path.yaml` to apply an updated definition to a saved thread.
 A changed sandbox configuration replaces its sandbox and preserves thread history
 and filesystem resources; files outside persistent mounts are discarded. Omitting
@@ -431,23 +429,23 @@ on port 5173, an API on port 8000, and PostgreSQL inside the VM. With an OpenAI
 credential saved as `openai` in the global vault, run from this checkout:
 
 ```sh
-exo agent create fastapi-dev --file exoharness/examples/managed-agents/fastapi-developer.md
+exo agent create exoharness/examples/managed-agents/fastapi-developer.md --name fastapi-dev
 exo environment create fastapi-local --file exoharness/examples/environments/fastapi-smolvm.yaml
-exo agent run --agent fastapi-dev --environment fastapi-local --thread demo
+exo run fastapi-dev --environment fastapi-local --thread demo
 ```
 
 Ask the agent to start the services, then open the printed sandbox services page.
 The browser contacts the API preview directly; the setup script configures its
 URL and the backend's allowed frontend origin. Log in with `admin@example.com`
 and `changethis`. Initial setup installs the tools and locked dependencies on the
-VM's persistent disks. Resume with `exo agent run --agent fastapi-dev --thread demo`
+VM's persistent disks. Resume with `exo run fastapi-dev --thread demo`
 and ask the agent to start the services again.
 
 ## Pi
 
 ```sh
 exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin https://api.openai.com
-exo agent run --agent-file exoharness/examples/managed-agents/pi-assistant.md \
+exo run exoharness/examples/managed-agents/pi-assistant.md \
   --environment-file exoharness/examples/environments/pi-local.yaml
 ```
 
@@ -541,7 +539,7 @@ exo vault secret create personal github \
   --token-env GITHUB_TOKEN
 unset GITHUB_TOKEN
 
-exo agent run --agent-file exoharness/examples/managed-agents/github-analyst.md \
+exo run exoharness/examples/managed-agents/github-analyst.md \
   --vault personal
 ```
 
@@ -580,8 +578,8 @@ shadow a model credential with the same name. Thread attachments and selected MC
 secret references survive resume and fork:
 
 ```bash
-exo agent run --agent support --vault personal
-exo agent run --agent support --thread <thread-slug>
+exo run support --vault personal
+exo run support --thread <thread-slug>
 ```
 
 To attach a vault without starting a turn:
@@ -592,7 +590,7 @@ exo thread update support <thread-slug> --vault personal
 
 Adding a vault preserves the thread's history, environment, resources, and selected
 MCP credentials. It does not rebind existing credentials or change a resource's
-saved credential reference. Resume with `--agent-file <file> --thread <thread-slug>`
+saved credential reference. Resume with `exo run <file> --thread <thread-slug>`
 to apply a Git resource's updated `credential` name. Credential-only changes preserve
 the existing checkout, branches, commits, and uncommitted work. Git commands use
 that credential through the sandbox's egress proxy; real tokens stay outside the
@@ -601,7 +599,7 @@ Revoked secrets fail instead of switching to another account. Agent and thread
 records retain vault references, not copies of secret values.
 
 Store a model credential in the global vault, then name it in the agent's
-`config.credential`:
+`model.credential`:
 
 ```bash
 exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin https://api.openai.com
@@ -653,10 +651,10 @@ The same CLI commands drive local Exo and an HTTP runtime:
 exo provider create local --local-root .exo
 exo provider create oss --url http://localhost:8080/exo
 exo provider switch oss
-exo agent create analyst --file ./analyst.md
-exo agent run --agent analyst --prompt "Summarize this project"
+exo agent create ./analyst.md
+exo run analyst --prompt "Summarize this project"
 exo thread list analyst
-exo agent run --agent analyst --thread <thread-slug>
+exo run analyst --thread <thread-slug>
 ```
 
 `exo provider switch <name>` persists the selection globally for future commands.
@@ -677,7 +675,7 @@ each thread. Client credentials and harness modules are not copied to the server
 `type: provider` asks the selected runtime to resolve its built-in MCP; `name`
 only sets its local tool namespace and grants no vault access.
 
-HTTP `--agent-file` runs sync saved agents through the same API as explicit
+HTTP `exo run FILE.md` runs sync saved agents through the same API as explicit
 creation and updates. Saved HTTP turns continue after the CLI disconnects;
 reopening their thread recovers durable history, not missed streaming previews.
 

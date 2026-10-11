@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Exo</title>
+    <meta name="robots" content="noindex" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta
+      name="description"
+      content="Exo is an open source runtime for agents defined in markdown. Run them from your terminal or behind an HTTP API."
+    />
+    <script>
+      // Shares VitePress's key so the homepage and docs keep the same theme.
+      const theme = localStorage.getItem("vitepress-theme-appearance");
+      if (theme === "light" || theme === "dark") {
+        document.documentElement.dataset.theme = theme;
+      }
+    </script>
+    <style>
+      /* Tokens. Each color is light-dark(light, dark); color-scheme picks
+         which, following the system unless data-theme pins it. */
+      :root {
+        color-scheme: light dark;
+        --paper: light-dark(#ffffff, #141416);
+        --ink: light-dark(#17171a, #e6e6e9);
+        --soft: light-dark(#6b6b73, #8e8e97);
+        --faint: light-dark(#b8b8bf, #4c4c54);
+        --key: light-dark(#1f4fd1, #82a8ff);
+        --badge: light-dark(#242424, #f4f4f2);
+        --badge-mark: light-dark(#f2f2f2, #1a1a1a);
+        --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        --serif:
+          Charter, "Iowan Old Style", "Bitstream Charter", Georgia, serif;
+        --code-size: 19px;
+      }
+      :root[data-theme="light"] {
+        color-scheme: light;
+      }
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+      }
+
+      /* Base */
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        -webkit-font-smoothing: antialiased;
+      }
+      body {
+        font: 17px/1.6 var(--serif);
+      }
+      header,
+      main {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 32px;
+      }
+      a:focus-visible,
+      button:focus-visible {
+        outline: 2px solid var(--key);
+        outline-offset: 3px;
+      }
+
+      /* Header */
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-top: 40px;
+        font-size: 15px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font: 600 15px var(--mono);
+        color: var(--ink);
+        text-decoration: none;
+      }
+      .brand svg {
+        width: 22px;
+        height: 22px;
+      }
+      nav {
+        display: flex;
+        align-items: center;
+      }
+      nav a {
+        margin-left: 24px;
+        color: var(--soft);
+        text-decoration: none;
+      }
+      nav a:hover {
+        color: var(--ink);
+        text-decoration: underline;
+      }
+      .theme {
+        display: flex;
+        margin-left: 24px;
+        padding: 2px;
+        border: 0;
+        background: none;
+        color: var(--soft);
+        cursor: pointer;
+      }
+      .theme:hover {
+        color: var(--ink);
+      }
+      .theme svg {
+        width: 14px;
+        height: 14px;
+      }
+      .theme .half,
+      .theme .full {
+        display: none;
+      }
+      .theme[data-mode="auto"] .half,
+      .theme[data-mode="dark"] .full {
+        display: inline;
+      }
+
+      /* Icon rows: how you reach the agent (above the file) and where it
+         runs (above the command). */
+      main {
+        padding-top: 9vh;
+        padding-bottom: 40px;
+      }
+      .filebar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin: 0 0 18px;
+      }
+      .filename {
+        margin: 0;
+        font: 14px var(--mono);
+        color: var(--soft);
+      }
+      .cmdbar {
+        display: flex;
+        justify-content: flex-end;
+        margin: 32px 0 8px;
+      }
+      .surfaces {
+        display: flex;
+        gap: 14px;
+      }
+      .surfaces button {
+        display: flex;
+        padding: 2px;
+        border: 0;
+        background: none;
+        color: var(--faint);
+        cursor: pointer;
+      }
+      .surfaces button:hover {
+        color: var(--soft);
+      }
+      .surfaces button[aria-pressed="true"] {
+        color: var(--ink);
+      }
+      .surfaces button:focus-visible {
+        outline: 1px solid var(--soft);
+        outline-offset: 2px;
+      }
+      .surfaces svg {
+        width: 16px;
+        height: 16px;
+      }
+      /* Brand marks keep their colors, so they dim with opacity instead. */
+      .surfaces .brand-mark svg {
+        width: 14px;
+        height: 14px;
+        margin: 1px;
+        opacity: 0.45;
+      }
+      .surfaces .brand-mark:hover svg {
+        opacity: 0.75;
+      }
+      .surfaces .brand-mark[aria-pressed="true"] svg {
+        opacity: 1;
+      }
+
+      /* Code: the agent file and the command */
+      pre {
+        margin: 0;
+        font: var(--code-size) / 1.7 var(--mono);
+        font-variant-ligatures: none;
+        counter-reset: line;
+        overflow-x: auto;
+      }
+      pre span.l {
+        display: block;
+      }
+      pre span.l::before {
+        counter-increment: line;
+        content: counter(line);
+        display: inline-block;
+        width: 2.5ch;
+        margin-right: 2ch;
+        text-align: right;
+        color: var(--faint);
+      }
+      .d {
+        color: var(--faint);
+      }
+      .k {
+        color: var(--key);
+      }
+      .run {
+        /* Room for the tallest command, so switching doesn't move what's
+           below. */
+        min-height: calc(3 * 1.7em);
+      }
+      .run .d {
+        user-select: none;
+      }
+
+      /* Harness values: click to rotate; they jiggle while hovered. --tilt
+         is set per value from its width, so long and short values swing
+         their ends the same distance. */
+      .swap {
+        display: inline-block;
+        cursor: pointer;
+        transition: opacity 0.9s ease;
+      }
+      .swap.out {
+        opacity: 0;
+      }
+      pre:has(.swap:hover) .swap {
+        animation: jiggle 0.5s ease-in-out infinite;
+      }
+      @keyframes jiggle {
+        25% {
+          transform: rotate(calc(var(--tilt, 2deg) * -1));
+        }
+        75% {
+          transform: rotate(var(--tilt, 2deg));
+        }
+      }
+
+      /* Pieces that only some choices show (data-when). Switching fades the
+         leaving pieces out, then the arriving ones in; shared text never
+         moves. Whole lines also open and close their space. */
+      .part {
+        transition: opacity 0.3s ease;
+      }
+      .part.out {
+        opacity: 0;
+      }
+      .part.off {
+        display: none;
+      }
+      pre span.l.part {
+        max-height: 1.7em;
+        overflow: hidden;
+        transition:
+          max-height 0.35s ease,
+          opacity 0.3s ease 0.3s;
+      }
+      pre span.l.part.out {
+        max-height: 0;
+        transition:
+          opacity 0.2s ease,
+          max-height 0.35s ease 0.15s;
+      }
+      pre span.l.part.out::before {
+        counter-increment: none;
+      }
+
+      /* About */
+      .about {
+        margin: 56px 0 0;
+        max-width: 34em;
+      }
+      .about p {
+        margin: 0 0 1em;
+      }
+      .links {
+        font-size: 15px;
+        color: var(--soft);
+      }
+      .links a {
+        color: var(--ink);
+      }
+      .links a:hover {
+        text-decoration: underline;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .swap,
+        .part,
+        pre span.l.part,
+        pre span.l.part.out {
+          transition: none;
+        }
+        pre:has(.swap:hover) .swap {
+          animation: none;
+        }
+      }
+      @media (max-width: 640px) {
+        :root {
+          --code-size: 13px;
+        }
+        /* Line numbers would cost a fifth of a phone's width. */
+        pre span.l::before {
+          display: none;
+        }
+        /* Let long commands wrap instead of hiding behind a scroll. */
+        .run {
+          white-space: pre-wrap;
+          overflow-wrap: anywhere;
+        }
+        header,
+        main {
+          padding-left: 20px;
+          padding-right: 20px;
+        }
+        nav a,
+        .theme {
+          margin-left: 16px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/v2">
+        <svg viewBox="0 0 512 512" aria-hidden="true">
+          <circle cx="256" cy="256" r="256" fill="var(--badge)" />
+          <g transform="translate(156,123)" fill="var(--badge-mark)">
+            <path d="M0,0 L87,45 L87,135 L0,75 Z" />
+            <path d="M0,266 L87,221 L87,131 L0,191 Z" />
+            <path d="M200,0 L113,45 L113,135 L200,75 Z" />
+            <path d="M200,266 L113,221 L113,131 L200,191 Z" />
+          </g>
+        </svg>
+        Exo
+      </a>
+      <nav>
+        <a href="/docs/">Docs</a>
+        <a href="https://github.com/exoharness/exo">GitHub</a>
+        <a href="https://discord.gg/8x23hdBJU6">Discord</a>
+        <button class="theme" type="button">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <circle
+              cx="8"
+              cy="8"
+              r="6.25"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+            />
+            <path class="half" d="M8 2a6 6 0 0 0 0 12z" fill="currentColor" />
+            <circle class="full" cx="8" cy="8" r="6" fill="currentColor" />
+          </svg>
+        </button>
+      </nav>
+    </header>
+    <main>
+      <div class="filebar">
+        <p class="filename">jq-triage.md</p>
+        <div class="surfaces" role="group" aria-label="How you reach the agent">
+          <button
+            type="button"
+            data-dimension="surface"
+            data-value="terminal"
+            aria-pressed="true"
+            aria-label="Terminal"
+            title="Terminal"
+          >
+            <svg
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" />
+              <path d="M4.5 6.5 6.5 8l-2 1.5M8.5 10h3" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            data-dimension="surface"
+            data-value="api"
+            aria-pressed="false"
+            aria-label="HTTP API"
+            title="HTTP API"
+          >
+            <svg
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path
+                d="M5.5 2.5C4 2.5 4 3.5 4 5s-.5 2.5-1.5 3c1 .5 1.5 1.5 1.5 3s0 2.5 1.5 2.5M10.5 2.5c1.5 0 1.5 1 1.5 2.5s.5 2.5 1.5 3c-1 .5-1.5 1.5-1.5 3s0 2.5-1.5 2.5"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="brand-mark"
+            data-dimension="surface"
+            data-value="slack"
+            aria-pressed="false"
+            aria-label="Slack"
+            title="Slack"
+          >
+            <svg viewBox="0 0 122.8 122.8" aria-hidden="true">
+              <path
+                fill="#e01e5a"
+                d="M25.8 77.6c0 7.1-5.8 12.9-12.9 12.9S0 84.7 0 77.6s5.8-12.9 12.9-12.9h12.9v12.9zm6.5 0c0-7.1 5.8-12.9 12.9-12.9s12.9 5.8 12.9 12.9v32.3c0 7.1-5.8 12.9-12.9 12.9s-12.9-5.8-12.9-12.9V77.6z"
+              />
+              <path
+                fill="#36c5f0"
+                d="M45.2 25.8c-7.1 0-12.9-5.8-12.9-12.9S38.1 0 45.2 0s12.9 5.8 12.9 12.9v12.9H45.2zm0 6.5c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9H12.9C5.8 58.1 0 52.3 0 45.2s5.8-12.9 12.9-12.9h32.3z"
+              />
+              <path
+                fill="#2eb67d"
+                d="M97 45.2c0-7.1 5.8-12.9 12.9-12.9s12.9 5.8 12.9 12.9-5.8 12.9-12.9 12.9H97V45.2zm-6.5 0c0 7.1-5.8 12.9-12.9 12.9s-12.9-5.8-12.9-12.9V12.9C64.7 5.8 70.5 0 77.6 0s12.9 5.8 12.9 12.9v32.3z"
+              />
+              <path
+                fill="#ecb22e"
+                d="M77.6 97c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9-12.9-5.8-12.9-12.9V97h12.9zm0-6.5c-7.1 0-12.9-5.8-12.9-12.9s5.8-12.9 12.9-12.9h32.3c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9H77.6z"
+              />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <pre><span class="l"><span class="d">---</span></span><span class="l"><span class="k">harness:</span> <span class="swap" data-values="codex claude-code pi">codex</span></span><span class="l"><span class="k">model:</span></span><span class="l">  <span class="k">name:</span> <span class="swap" data-values="gpt-6.1-sol opus-5.5 zai-org/GLM-5.3-Flash">gpt-6.1-sol</span></span><span class="l">  <span class="k">credential:</span> <span class="swap" data-values="openai anthropic baseten">openai</span></span><span class="l"><span class="k">resources:</span></span><span class="l">  - <span class="k">name:</span> jq</span><span class="l">    <span class="k">type:</span> git</span><span class="l">    <span class="k">url:</span> https://github.com/jqlang/jq</span><span class="l part off" data-when="slack:*"><span class="k">adapters:</span></span><span class="l part off" data-when="slack:*">  - <span class="k">type:</span> slack</span><span class="l part off" data-when="slack:*">    <span class="k">vault:</span> jq-slack</span><span class="l"><span class="d">---</span></span><span class="l"> </span><span class="l">Given a bug report against jq, reproduce it</span><span class="l">from source, explain what you found, and</span><span class="l">propose a fix.</span></pre>
+      <div class="cmdbar">
+        <div class="surfaces" role="group" aria-label="Where the agent runs">
+          <button
+            type="button"
+            data-dimension="provider"
+            data-value="local"
+            aria-pressed="true"
+            aria-label="Your machine"
+            title="Your machine"
+          >
+            <svg
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="3" y="3.5" width="10" height="7" rx="1" />
+              <path d="M1.5 12.5h13" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            data-dimension="provider"
+            data-value="braintrust"
+            aria-pressed="false"
+            aria-label="Braintrust"
+            title="Braintrust"
+          >
+            <svg viewBox="0 0 25 24" fill="currentColor" aria-hidden="true">
+              <rect
+                x="12.9961"
+                y="2"
+                width="6.0644"
+                height="6.1367"
+                rx="2.02"
+              />
+              <rect
+                x="12.9961"
+                y="8.9316"
+                width="6.0644"
+                height="6.1368"
+                rx="2.02"
+              />
+              <rect
+                x="12.9961"
+                y="15.8633"
+                width="6.0644"
+                height="6.1367"
+                rx="2.02"
+              />
+              <rect
+                x="16.0283"
+                y="12.3975"
+                width="6.0645"
+                height="6.1367"
+                rx="2.02"
+              />
+              <rect
+                x="16.0283"
+                y="5.4658"
+                width="6.0645"
+                height="6.1367"
+                rx="2.02"
+              />
+              <rect
+                x="6.0332"
+                y="15.8633"
+                width="6.0645"
+                height="6.1367"
+                rx="2.02"
+              />
+              <rect
+                x="6.0332"
+                y="8.9316"
+                width="6.0645"
+                height="6.1368"
+                rx="2.02"
+              />
+              <rect x="6.0332" y="2" width="6.0645" height="6.1367" rx="2.02" />
+              <rect x="3" y="5.4658" width="6.0654" height="6.1367" rx="2.02" />
+              <rect
+                x="3"
+                y="12.3975"
+                width="6.0654"
+                height="6.1367"
+                rx="2.02"
+              />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="brand-mark"
+            data-dimension="provider"
+            data-value="cloudflare"
+            aria-pressed="false"
+            aria-label="Cloudflare"
+            title="Cloudflare"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="#f38020"
+                d="M16.5088 16.8447c.1475-.5068.0908-.9707-.1553-1.3154-.2246-.3164-.6045-.499-1.0615-.5205l-8.6592-.1123a.1559.1559 0 0 1-.1333-.0713c-.0283-.042-.0351-.0986-.021-.1553.0278-.084.1123-.1484.2036-.1562l8.7359-.1123c1.0351-.0489 2.1601-.8868 2.5537-1.9136l.499-1.3013c.0215-.0561.0293-.1128.0147-.168-.5625-2.5463-2.835-4.4453-5.5499-4.4453-2.5039 0-4.6284 1.6177-5.3876 3.8614-.4927-.3658-1.1187-.5625-1.794-.499-1.2026.119-2.1665 1.083-2.2861 2.2856-.0283.31-.0069.6128.0635.894C1.5683 13.171 0 14.7754 0 16.752c0 .1748.0142.3515.0352.5273.0141.083.0844.1475.1689.1475h15.9814c.0909 0 .1758-.0645.2032-.1553l.12-.4268zm2.7568-5.5634c-.0771 0-.1611 0-.2383.0112-.0566 0-.1054.0415-.127.0976l-.3378 1.1744c-.1475.5068-.0918.9707.1543 1.3164.2256.3164.6055.498 1.0625.5195l1.8437.1133c.0557 0 .1055.0263.1329.0703.0283.043.0351.1074.0214.1562-.0283.084-.1132.1485-.204.1553l-1.921.1123c-1.041.0488-2.1582.8867-2.5527 1.914l-.1406.3585c-.0283.0713.0215.1416.0986.1416h6.5977c.0771 0 .1474-.0489.169-.126.1122-.4082.1757-.837.1757-1.2803 0-2.6025-2.125-4.727-4.7344-4.727"
+              />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <pre
+        class="run"
+      ><span class="d">$ </span><span class="part" data-when="*:local terminal:*">exo run jq-triage.md</span><span class="part" data-when="api:braintrust api:cloudflare slack:braintrust slack:cloudflare">exo agent create jq-triage.md</span><span class="part" data-when="api:local slack:local"> --serve</span><span class="part" data-when="*:braintrust"> --provider braintrust</span><span class="part" data-when="*:cloudflare"> --provider my-worker</span><span class="part" data-when="terminal:*"> \
+    --prompt "jq segfaults on deeply nested input"</span><span class="part" data-when="api:*">
+<span class="d">$ </span>curl <span class="part" data-when="*:local">localhost:4766/exo/turn</span><span class="part" data-when="*:cloudflare">my-worker.workers.dev/exo/agent/$AGENT_ID/turn</span><span class="part" data-when="*:braintrust">api.braintrust.dev/exo/agent/$AGENT_ID/turn</span> \
+    --json '{"input": "jq segfaults on deeply nested input"}'</span></pre>
+      <div class="about">
+        <p>
+          Exo is a minimal open source runtime for agents. Run the harness of
+          your choice with sandboxes, durable history, and secure access to your
+          code, tools, models, and integrations.
+        </p>
+        <p class="links">
+          <a href="/docs/">Read the docs</a> or start with the
+          <a href="/docs/tutorials/support-agent">support agent tutorial</a>.
+        </p>
+      </div>
+    </main>
+    <script>
+      const root = document.documentElement;
+      const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      // Harness values. Clicking one switches the example to the next
+      // harness, fading each value in place.
+      {
+        const swaps = document.querySelectorAll(".swap");
+        let step = 0;
+        let fading = false;
+        // Angle whose arc moves each end of the value about 1.5px, capped so
+        // very short values like "pi" don't visibly tip over.
+        const tilt = (swap) => {
+          const half = swap.getBoundingClientRect().width / 2;
+          const degrees = Math.min((Math.atan(1.5 / half) * 180) / Math.PI, 4);
+          swap.style.setProperty("--tilt", `${degrees}deg`);
+        };
+        const advance = () => {
+          if (fading) {
+            return;
+          }
+          fading = true;
+          step += 1;
+          for (const swap of swaps) {
+            swap.classList.add("out");
+          }
+          setTimeout(
+            () => {
+              for (const swap of swaps) {
+                const values = swap.dataset.values.split(" ");
+                swap.textContent = values[step % values.length];
+                swap.classList.remove("out");
+                tilt(swap);
+              }
+              fading = false;
+            },
+            still ? 0 : 900,
+          );
+        };
+        for (const swap of swaps) {
+          tilt(swap);
+          swap.addEventListener("click", advance);
+        }
+      }
+
+      // Icon rows pick how you reach the agent (surface) and where it runs
+      // (provider). Pieces of the file and command show when one of their
+      // data-when "surface:provider" pairs matches (* matches anything). The
+      // choice lives in the URL hash (#api, #slack-braintrust) so it can be
+      // shared; the defaults have no hash.
+      {
+        const choices = document.querySelectorAll("[data-dimension]");
+        const parts = [...document.querySelectorAll(".part")];
+        const defaults = { surface: "terminal", provider: "local" };
+        const dimensions = Object.keys(defaults);
+        const valuesOf = (dimension) =>
+          [...choices]
+            .filter((choice) => choice.dataset.dimension === dimension)
+            .map((choice) => choice.dataset.value);
+        const fromHash = () => {
+          const state = { ...defaults };
+          for (const token of location.hash.slice(1).split("-")) {
+            for (const dimension of dimensions) {
+              if (valuesOf(dimension).includes(token)) {
+                state[dimension] = token;
+              }
+            }
+          }
+          return state;
+        };
+        const toHash = (state) =>
+          dimensions
+            .filter((dimension) => state[dimension] !== defaults[dimension])
+            .map((dimension) => state[dimension])
+            .join("-");
+        const shows = (part, state) =>
+          part.dataset.when.split(" ").some((pair) => {
+            const [surface, provider] = pair.split(":");
+            return (
+              (surface === "*" || surface === state.surface) &&
+              (provider === "*" || provider === state.provider)
+            );
+          });
+        const isLine = (part) => part.classList.contains("l");
+        const isOff = (part) => part.classList.contains("off");
+        const isOut = (part) => part.classList.contains("out");
+        const reveal = (pieces) => {
+          for (const part of pieces) {
+            part.classList.add("out");
+            part.classList.remove("off");
+          }
+          // Flush layout so the pieces animate from their hidden state.
+          root.getBoundingClientRect();
+          for (const part of pieces) {
+            part.classList.remove("out");
+          }
+        };
+
+        let state = fromHash();
+        let switches = 0;
+        const press = () => {
+          for (const choice of choices) {
+            choice.setAttribute(
+              "aria-pressed",
+              String(state[choice.dataset.dimension] === choice.dataset.value),
+            );
+          }
+        };
+        const show = (next) => {
+          if (toHash(next) === toHash(state)) {
+            return;
+          }
+          state = next;
+          press();
+          // Based on what's on screen, so a quick second click mid-switch
+          // picks up from wherever the first one got to.
+          const switching = ++switches;
+          const leaving = parts.filter(
+            (part) => !isOff(part) && !shows(part, next),
+          );
+          const arriving = parts.filter(
+            (part) => shows(part, next) && (isOff(part) || isOut(part)),
+          );
+          for (const part of leaving) {
+            part.classList.add("out");
+          }
+          // Whole lines (frontmatter) don't share space with anything
+          // leaving, so they start opening right away. Inline command pieces
+          // wait for the leaving ones to fade, so old and new text never
+          // overlap.
+          reveal(arriving.filter(isLine));
+          let wait = 0;
+          if (!still && leaving.length) {
+            wait = leaving.some(isLine) ? 500 : 300;
+          }
+          setTimeout(() => {
+            if (switching !== switches) {
+              return;
+            }
+            for (const part of leaving) {
+              part.classList.add("off");
+              part.classList.remove("out");
+            }
+            reveal(arriving.filter((part) => !isLine(part)));
+          }, wait);
+        };
+
+        for (const choice of choices) {
+          choice.addEventListener("click", () => {
+            const next = {
+              ...state,
+              [choice.dataset.dimension]: choice.dataset.value,
+            };
+            const hash = toHash(next);
+            // Replace rather than push, so the icons don't fill the back
+            // button.
+            history.replaceState(
+              null,
+              "",
+              hash ? `#${hash}` : location.pathname + location.search,
+            );
+            show(next);
+          });
+        }
+        addEventListener("hashchange", () => show(fromHash()));
+        press();
+        for (const part of parts) {
+          part.classList.toggle("off", !shows(part, state));
+        }
+      }
+
+      // Theme switch: cycles system, light, and dark. Same storage key and
+      // values as the docs' switch, so the choice carries between them.
+      {
+        const toggle = document.querySelector(".theme");
+        const modes = ["auto", "light", "dark"];
+        const names = { auto: "system", light: "light", dark: "dark" };
+        const render = () => {
+          const mode = root.dataset.theme ?? "auto";
+          const label = `Theme: ${names[mode]}`;
+          toggle.dataset.mode = mode;
+          toggle.title = label;
+          toggle.setAttribute("aria-label", label);
+        };
+        toggle.addEventListener("click", () => {
+          const mode = root.dataset.theme ?? "auto";
+          const next = modes[(modes.indexOf(mode) + 1) % modes.length];
+          if (next === "auto") {
+            delete root.dataset.theme;
+          } else {
+            root.dataset.theme = next;
+          }
+          localStorage.setItem("vitepress-theme-appearance", next);
+          render();
+        });
+        render();
+      }
+    </script>
+  </body>
+</html>

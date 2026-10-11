@@ -130,7 +130,7 @@ class TrajectoryTest(unittest.IsolatedAsyncioTestCase):
                 "harbor-shared",
                 TRIAL_ID,
                 "Do the task",
-                "gpt-5.5",
+                "gpt-6.1-sol",
                 destination,
             )
             output = json.loads(destination.read_text())
@@ -205,7 +205,7 @@ class TrajectoryTest(unittest.IsolatedAsyncioTestCase):
                         "event-4",
                         [{"role": "assistant", "content": "Created the file.", "id": None}],
                         usage={
-                            "model": "gpt-5.5",
+                            "model": "gpt-6.1-sol",
                             "prompt_tokens": 1069,
                             "completion_tokens": 16,
                             "prompt_cached_tokens": 0,
@@ -222,7 +222,7 @@ class TrajectoryTest(unittest.IsolatedAsyncioTestCase):
             trial_id=TRIAL_ID,
             turn_ids=[TURN_ID],
             instruction="Do the task",
-            model_name="gpt-5.5",
+            model_name="gpt-6.1-sol",
             conversation="trial-1",
             started_at="2026-08-07T21:09:02.215Z",
         )
@@ -278,7 +278,7 @@ class TrajectoryTest(unittest.IsolatedAsyncioTestCase):
             trial_id=TRIAL_ID,
             turn_ids=[TURN_ID],
             instruction="Do the task",
-            model_name="gpt-5.5",
+            model_name="gpt-6.1-sol",
             conversation="trial-1",
             started_at="2026-08-07T21:09:02.215Z",
         )
@@ -305,7 +305,7 @@ class TrajectoryTest(unittest.IsolatedAsyncioTestCase):
             trial_id=TRIAL_ID,
             turn_ids=[TURN_ID],
             instruction="Do the task",
-            model_name="gpt-5.5",
+            model_name="gpt-6.1-sol",
             conversation="harbor-shared",
             started_at="2026-08-07T21:09:02.215Z",
         )

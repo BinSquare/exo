@@ -55,6 +55,10 @@ import {
 
 import { codexReplayItems, replayCodexHistory } from "./replay";
 import {
+  getClientToolModelInput,
+  toolResultFailed,
+} from "../harness/client-tools";
+import {
   assertNativeToolSafety,
   nativeItemComplete,
   nativeTurnSnapshot,
@@ -1041,10 +1045,26 @@ async function executeDynamicToolCall(
       toolCall,
       "codex_dynamic_tool",
     );
+    const input = await getClientToolModelInput(context, toolName, callId);
+    const contentItems =
+      input == null
+        ? null
+        : typeof input === "string"
+          ? [{ type: "inputText", text: input }]
+          : input.map((part) => {
+              if (part.type === "text")
+                return { type: "inputText", text: part.text };
+              if (part.type === "image" && typeof part.image === "string") {
+                return { type: "inputImage", imageUrl: part.image };
+              }
+              throw new Error(
+                "Codex client tool model input requires text or images with string URLs",
+              );
+            });
     await appendEvents(context, [toolResultEvent(callId, result)]);
-    return dynamicToolResultResponse(JSON.stringify(result), {
-      success: true,
-    });
+    const success = !toolResultFailed(result);
+    if (contentItems) return toJsonValue({ contentItems, success });
+    return dynamicToolResultResponse(JSON.stringify(result), { success });
   } catch (error) {
     const message = errorMessage(error);
     await appendEvents(context, [
@@ -1426,7 +1446,7 @@ async function requireCodexSandboxNetworking(
 function codexSandboxNetworkingError(context: TurnContext): string {
   return [
     "Codex requires agent networking because it runs model calls inside the exoharness sandbox.",
-    `Set sandbox.enable_networking to true in the agent spec, then run: exo agent update ${context.exoharness.current.agent.record.slug} --file agent.md`,
+    `Enable networking in the thread's environment, then run: exo run ${context.exoharness.current.agent.record.slug} --environment-file environment.yaml`,
   ].join(" ");
 }
 

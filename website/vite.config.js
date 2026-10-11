@@ -15,13 +15,12 @@ export default defineConfig({
     react(),
     tailwindcss(),
     {
-      name: "exo-chat-dev-route",
+      name: "exo-html-dev-routes",
       configureServer(server) {
         server.middlewares.use((request, _response, next) => {
-          if (request.url?.startsWith("/chat?")) {
-            request.url = request.url.replace("/chat?", "/chat.html?");
-          } else if (request.url === "/chat") {
-            request.url = "/chat.html";
+          const page = request.url?.match(/^\/(chat|v2)\/?(\?.*)?$/);
+          if (page) {
+            request.url = `/${page[1]}.html${page[2] ?? ""}`;
           }
           next();
         });
@@ -35,6 +34,7 @@ export default defineConfig({
       input: {
         chat: fileURLToPath(new URL("chat.html", import.meta.url)),
         main: fileURLToPath(new URL("index.html", import.meta.url)),
+        v2: fileURLToPath(new URL("v2.html", import.meta.url)),
       },
     },
   },

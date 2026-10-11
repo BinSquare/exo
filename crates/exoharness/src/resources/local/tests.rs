@@ -4,7 +4,7 @@ use crate::{FileSystemMountMode, Uuid7};
 fn resource(source: ResourceSource) -> ResourceDefinition {
     ResourceDefinition {
         name: "code".into(),
-        mount_path: "/workspace".into(),
+        mount_path: Some("/workspace".into()),
         mode: FileSystemMountMode::ReadWrite,
         source,
     }
@@ -303,6 +303,39 @@ fn directory_copy_preserves_links_and_excludes_runtime_state() -> Result<()> {
 }
 
 #[test]
+fn checkout_resolves_branches_tags_and_full_commits() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo)?;
+    git(&repo, ["init", "--initial-branch=main"], None)?;
+    let tagged = commit(&repo, "release")?;
+    git(&repo, ["tag", "v1"], None)?;
+    let latest = commit(&repo, "latest")?;
+    git(
+        &repo,
+        ["update-ref", "refs/remotes/origin/main", &latest],
+        None,
+    )?;
+    let store = ResourceStore::new(&temp.path().join("state"))?;
+    for (reference, branch, revision) in [
+        ("main", Some("main"), &latest),
+        ("v1", None, &tagged),
+        (tagged.as_str(), None, &tagged),
+    ] {
+        assert_eq!(
+            store.resolve_checkout(&repo, Some(reference), None)?,
+            (branch.map(str::to_owned), revision.clone())
+        );
+    }
+    assert!(
+        store
+            .resolve_checkout(&repo, Some("missing"), None)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn imported_git_is_independent_and_preserves_dirty_index() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let source = temp.path().join("source");
@@ -360,9 +393,7 @@ fn check_git_thread_isolation(store: &ResourceStore, temp: &tempfile::TempDir) -
     let definition = resource(ResourceSource::GitRepository {
         path: None,
         url: Some(url::Url::from_directory_path(&source).unwrap().to_string()),
-        checkout: Some(GitCheckout::Branch {
-            name: "main".into(),
-        }),
+        checkout: Some("main".into()),
         credential: None,
     });
     let prepared = vec![PreparedResource {
@@ -578,13 +609,13 @@ fn sandbox_git_trust_is_limited_to_mounted_git_resources() -> Result<()> {
         checkout: None,
         credential: None,
     });
-    definition.mount_path = repository.to_string_lossy().into_owned();
+    definition.mount_path = Some(repository.to_string_lossy().into_owned());
     let mut unmounted = definition.clone();
     unmounted.name = "unmounted".into();
-    unmounted.mount_path = temp.path().join("unmounted").to_string_lossy().into_owned();
+    unmounted.mount_path = Some(temp.path().join("unmounted").to_string_lossy().into_owned());
     let mut directory = unmounted.clone();
     directory.name = "directory".into();
-    directory.mount_path = other.to_string_lossy().into_owned();
+    directory.mount_path = Some(other.to_string_lossy().into_owned());
     directory.source = ResourceSource::Directory {
         path: other.clone(),
     };

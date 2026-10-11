@@ -209,7 +209,7 @@ The snapshot's existence is also recorded in the conversation event log as
 
 ## CLI surface
 
-Inside the chat REPL (`exo agent run --agent <agent> --thread <conv>`):
+Inside the chat REPL (`exo run <agent> --thread <conv>`):
 
 ```
 /snapshot filesystem [<id>]  capture writable filesystem state

@@ -20,7 +20,7 @@ async fn local_and_http_cli_workflows() -> Result<()> {
         let file = f.agent_file.to_str().unwrap();
         f.cli(&["provider", "switch", provider]).await?;
         let created = mutation_output(
-            f.output(&["agent", "create", "saved", "--file", file], None, None)
+            f.output(&["agent", "create", file, "--name", "saved"], None, None)
                 .await?,
             provider,
         )?;
@@ -40,7 +40,7 @@ async fn local_and_http_cli_workflows() -> Result<()> {
                 std::fs::write(&invalid, source)?;
                 assert!(
                     !f.output(
-                        &["agent", "create", name, "--file", invalid.to_str().unwrap()],
+                        &["agent", "create", invalid.to_str().unwrap(), "--name", name],
                         None,
                         None
                     )
@@ -52,28 +52,15 @@ async fn local_and_http_cli_workflows() -> Result<()> {
             }
         }
         let first = mutation_output(
-            f.output(
-                &[
-                    "agent",
-                    "run",
-                    "--agent",
-                    "saved",
-                    "--prompt",
-                    "first input",
-                ],
-                None,
-                None,
-            )
-            .await?,
+            f.output(&["run", "saved", "--prompt", "first input"], None, None)
+                .await?,
             provider,
         )?;
         assert!(first.contains("Workflow reply."), "{provider}: {first}");
         let thread = thread_slug(&first)?;
         let resumed = f
             .cli(&[
-                "agent",
                 "run",
-                "--agent",
                 "saved",
                 "--thread",
                 thread,
@@ -86,7 +73,7 @@ async fn local_and_http_cli_workflows() -> Result<()> {
         assert!(f.cli(&["thread", "list", "saved"]).await?.contains(thread));
         let history = success(
             f.output(
-                &["agent", "run", "--agent", "saved", "--thread", thread],
+                &["run", "saved", "--thread", thread],
                 None,
                 Some("/history\n/quit\n"),
             )
@@ -136,9 +123,9 @@ async fn local_and_http_threads_accept_additional_vaults() -> Result<()> {
         f.cli(&[
             "agent",
             "create",
-            "saved",
-            "--file",
             f.agent_file.to_str().unwrap(),
+            "--name",
+            "saved",
         ])
         .await?;
         // Arrange records without claiming them for the server. The selected
@@ -194,8 +181,8 @@ async fn local_and_http_threads_accept_additional_vaults() -> Result<()> {
         let resumed = success(
             f.output(
                 &[
-                    "agent", "run", "--agent", "saved", "--thread", "original", "--vault", "team",
-                    "--vault", "personal", "--vault", "team",
+                    "run", "saved", "--thread", "original", "--vault", "team", "--vault",
+                    "personal", "--vault", "team",
                 ],
                 None,
                 Some("/quit\n"),
@@ -206,7 +193,7 @@ async fn local_and_http_threads_accept_additional_vaults() -> Result<()> {
         assert!(resumed.contains("vault: team"), "{resumed}");
         let again = success(
             f.output(
-                &["agent", "run", "--agent", "saved", "--thread", "original"],
+                &["run", "saved", "--thread", "original"],
                 None,
                 Some("/quit\n"),
             )
@@ -256,17 +243,10 @@ async fn local_and_http_file_runs_sync_saved_agents_and_preserve_history() -> Re
         let file = f.agent_file.to_str().context("agent file")?;
         let original = f
             .source()
-            .replace("config:", "config:\n  max_tool_round_trips: 17");
+            .replace("model:", "model:\n  max_tool_round_trips: 17");
         std::fs::write(&f.agent_file, &original)?;
         let first = f
-            .cli(&[
-                "agent",
-                "run",
-                "--agent-file",
-                file,
-                "--prompt",
-                "first file input",
-            ])
+            .cli(&["run", file, "--prompt", "first file input"])
             .await?;
         let agent = f
             .runtime
@@ -276,7 +256,20 @@ async fn local_and_http_file_runs_sync_saved_agents_and_preserve_history() -> Re
             .pop()
             .context("saved file agent")?;
         let slug = &agent.record().slug;
+        assert_eq!(slug, "agent");
         let first_thread = thread_slug(&first)?;
+        assert!(
+            !f.output(&["agent", "create", file], None, None)
+                .await?
+                .status
+                .success()
+        );
+        assert!(
+            !f.output(&["agent", "update", file, "--name", "missing"], None, None)
+                .await?
+                .status
+                .success()
+        );
         assert!(f.cli(&["agent", "list"]).await?.contains(slug));
         assert_eq!(
             executor::load_agent_config(agent.as_ref())
@@ -287,21 +280,18 @@ async fn local_and_http_file_runs_sync_saved_agents_and_preserve_history() -> Re
 
         let updated = f
             .source()
-            .replace("Workflow agent", "Renamed file agent")
             .replace("Reply to the user.", "Follow the updated instructions.");
         std::fs::write(&f.agent_file, &updated)?;
+        f.cli(&["agent", "update", file]).await?;
+        assert_eq!(
+            f.runtime.get_agent(slug).await?.unwrap().record().id,
+            agent.record().id
+        );
         let directory = f.temp.path().join("nested");
         std::fs::create_dir(&directory)?;
         let second = success(
             f.output(
-                &[
-                    "agent",
-                    "run",
-                    "--agent-file",
-                    "../agent.md",
-                    "--prompt",
-                    "second file input",
-                ],
+                &["run", "../agent.md", "--prompt", "second file input"],
                 Some(&directory),
                 None,
             )
@@ -330,8 +320,7 @@ async fn local_and_http_file_runs_sync_saved_agents_and_preserve_history() -> Re
             .context("model requests")?;
         let request = String::from_utf8_lossy(&requests.last().context("updated turn")?.body);
         assert!(
-            request.contains("You are Renamed file agent.")
-                && request.contains("Follow the updated instructions."),
+            request.contains("Follow the updated instructions."),
             "{request}"
         );
         assert!(!request.contains("Reply to the user."), "{request}");
@@ -341,14 +330,10 @@ async fn local_and_http_file_runs_sync_saved_agents_and_preserve_history() -> Re
             updated.replace("harness: basic", "harness: unknown"),
         )?;
         assert!(
-            !f.output(
-                &["agent", "run", "--agent-file", file, "--prompt", "invalid"],
-                None,
-                None
-            )
-            .await?
-            .status
-            .success()
+            !f.output(&["run", file, "--prompt", "invalid"], None, None)
+                .await?
+                .status
+                .success()
         );
         assert_eq!(
             exo_managed_agents::load_definition(agent.as_ref())
@@ -360,9 +345,7 @@ async fn local_and_http_file_runs_sync_saved_agents_and_preserve_history() -> Re
         std::fs::write(&f.agent_file, &updated)?;
         let resumed = f
             .cli(&[
-                "agent",
                 "run",
-                "--agent-file",
                 file,
                 "--thread",
                 first_thread,
@@ -379,7 +362,7 @@ async fn local_and_http_file_runs_sync_saved_agents_and_preserve_history() -> Re
         );
         let history = success(
             f.output(
-                &["agent", "run", "--agent", slug, "--thread", first_thread],
+                &["run", slug, "--thread", first_thread],
                 None,
                 Some("/history\n/quit\n"),
             )
@@ -394,12 +377,20 @@ async fn local_and_http_file_runs_sync_saved_agents_and_preserve_history() -> Re
         let other = directory.join("agent.md");
         std::fs::write(&other, updated)?;
         f.cli(&[
-            "agent",
             "run",
-            "--agent-file",
             other.to_str().context("other file")?,
             "--prompt",
             "other file input",
+        ])
+        .await?;
+        assert_eq!(f.runtime.list_agents().await?.len(), 1);
+        f.cli(&[
+            "run",
+            other.to_str().context("other file")?,
+            "--slug",
+            "other",
+            "--prompt",
+            "distinct agent input",
         ])
         .await?;
         let agents = f.runtime.list_agents().await?;
@@ -460,14 +451,12 @@ async fn provider_crud_defaults_and_aliases_survive_cli_restarts() -> Result<()>
     f.cli(&[
         "agent",
         "create",
-        "pinned",
-        "--file",
         f.agent_file.to_str().unwrap(),
+        "--name",
+        "pinned",
     ])
     .await?;
-    let first = f
-        .cli(&["agent", "run", "--agent", "pinned", "--prompt", "hello"])
-        .await?;
+    let first = f.cli(&["run", "pinned", "--prompt", "hello"]).await?;
     let thread = thread_slug(&first)?;
     f.cli(&["provider", "switch", "local"]).await?;
     f.contexts.lock().unwrap().clear();
@@ -616,9 +605,9 @@ async fn local_and_http_live_cancellation_finalizes_and_allows_resume() -> Resul
         f.cli(&[
             "agent",
             "create",
-            "saved",
-            "--file",
             f.agent_file.to_str().unwrap(),
+            "--name",
+            "saved",
         ])
         .await?;
         let delay = Mock::given(method("POST"))
@@ -629,16 +618,9 @@ async fn local_and_http_live_cancellation_finalizes_and_allows_resume() -> Resul
             .mount_as_scoped(&f.model)
             .await;
         let args = if mode == "chat" {
-            vec!["agent", "run", "--agent", "saved"]
+            vec!["run", "saved"]
         } else {
-            vec![
-                "agent",
-                "run",
-                "--agent",
-                "saved",
-                "--prompt",
-                "cancel this turn",
-            ]
+            vec!["run", "saved", "--prompt", "cancel this turn"]
         };
         let mut child = f
             .command(&args)
@@ -696,18 +678,9 @@ async fn local_and_http_live_cancellation_finalizes_and_allows_resume() -> Resul
         );
         drop(delay);
         assert!(
-            f.cli(&[
-                "agent",
-                "run",
-                "--agent",
-                "saved",
-                "--thread",
-                thread,
-                "--prompt",
-                "try again"
-            ])
-            .await?
-            .contains("Workflow reply.")
+            f.cli(&["run", "saved", "--thread", thread, "--prompt", "try again"])
+                .await?
+                .contains("Workflow reply.")
         );
         f.stop().await?;
     }
@@ -731,9 +704,9 @@ async fn saved_http_turn_survives_cli_disconnect_and_another_file_run() -> Resul
     f.cli(&[
         "agent",
         "create",
-        "saved",
-        "--file",
         f.agent_file.to_str().unwrap(),
+        "--name",
+        "saved",
     ])
     .await?;
     let delay = Mock::given(method("POST"))
@@ -744,14 +717,7 @@ async fn saved_http_turn_survives_cli_disconnect_and_another_file_run() -> Resul
         .mount_as_scoped(&f.model)
         .await;
     let mut child = f
-        .command(&[
-            "agent",
-            "run",
-            "--agent",
-            "saved",
-            "--prompt",
-            "detached turn",
-        ])
+        .command(&["run", "saved", "--prompt", "detached turn"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -779,9 +745,7 @@ async fn saved_http_turn_survives_cli_disconnect_and_another_file_run() -> Resul
     );
     let file_run = f
         .cli(&[
-            "agent",
             "run",
-            "--agent-file",
             f.agent_file.to_str().unwrap(),
             "--prompt",
             "short file turn",
@@ -824,7 +788,7 @@ async fn saved_http_turn_survives_cli_disconnect_and_another_file_run() -> Resul
     drop(watch);
     let history = success(
         f.output(
-            &["agent", "run", "--agent", "saved", "--thread", slug],
+            &["run", "saved", "--thread", slug],
             None,
             Some("/history\n/quit\n"),
         )
@@ -879,9 +843,9 @@ async fn local_and_http_providers_configure_named_harnesses() -> Result<()> {
             f.cli(&[
                 "agent",
                 "create",
-                &name,
-                "--file",
                 f.agent_file.to_str().unwrap(),
+                "--name",
+                &name,
             ])
             .await?;
             let state = f.runtime.exoharness_handle();
@@ -903,12 +867,8 @@ async fn local_and_http_providers_configure_named_harnesses() -> Result<()> {
                 assert!(std::path::Path::new(&module.module_path).is_file());
             }
             success(
-                f.output(
-                    &["agent", "run", "--harness", harness, "--agent", &name],
-                    None,
-                    Some("/quit\n"),
-                )
-                .await?,
+                f.output(&["run", "--harness", harness, &name], None, Some("/quit\n"))
+                    .await?,
             )?;
         }
     }
@@ -1004,7 +964,7 @@ export default defineHarness({{
     )?;
     assert!(!f.temp.path().join(&module).exists());
     let source = format!(
-        "---\nname: Remote workspace\nharness: {module}\nconfig:\n  model: gpt-5-mini\nmcp_servers:\n  - type: url\n    name: workspace\n    permission_policy: {{type: always_allow}}\n    url: {url}\n---\nLook up the workspace.\n"
+        "---\nharness: {module}\nmodel:\n  name: gpt-5-mini\nmcp_servers:\n  - type: url\n    name: workspace\n    permission_policy: {{type: always_allow}}\n    url: {url}\n---\nLook up the workspace.\n"
     );
     std::fs::write(&f.agent_file, &source)?;
     f.cli(&["provider", "switch", "remote"]).await?;
@@ -1012,9 +972,9 @@ export default defineHarness({{
     f.cli(&[
         "agent",
         "create",
-        "remote-workspace",
-        "--file",
         f.agent_file.to_str().unwrap(),
+        "--name",
+        "remote-workspace",
     ])
     .await?;
     let state = f.runtime.exoharness_handle();
@@ -1028,9 +988,7 @@ export default defineHarness({{
     );
     let first = f
         .cli(&[
-            "agent",
             "run",
-            "--agent",
             "remote-workspace",
             "--vault",
             "server-only",
@@ -1041,9 +999,7 @@ export default defineHarness({{
     assert!(first.contains("Server workspace"), "{first}");
     let other = f
         .cli(&[
-            "agent",
             "run",
-            "--agent",
             "remote-workspace",
             "--vault",
             "other",
@@ -1054,9 +1010,7 @@ export default defineHarness({{
     assert!(other.contains("Other workspace"), "{other}");
     let resumed = f
         .cli(&[
-            "agent",
             "run",
-            "--agent",
             "remote-workspace",
             "--thread",
             thread_slug(&first)?,
@@ -1069,9 +1023,7 @@ export default defineHarness({{
     assert!(resumed.contains("Server workspace"), "{resumed}");
     let file_run = f
         .cli(&[
-            "agent",
             "run",
-            "--agent-file",
             f.agent_file.to_str().unwrap(),
             "--vault",
             "other",
@@ -1080,7 +1032,7 @@ export default defineHarness({{
         ])
         .await?;
     assert!(file_run.contains("Other workspace"), "{file_run}");
-    assert!(f.cli(&["agent", "list"]).await?.contains("agent-"));
+    assert!(f.cli(&["agent", "list"]).await?.contains("agent "));
     assert!(!f.root.exists(), "remote execution created local state");
     assert!(f.model.received_requests().await.unwrap().is_empty());
     success(
@@ -1101,9 +1053,7 @@ export default defineHarness({{
     )?;
     let rotated = f
         .cli(&[
-            "agent",
             "run",
-            "--agent",
             "remote-workspace",
             "--thread",
             thread_slug(&first)?,
@@ -1125,9 +1075,7 @@ export default defineHarness({{
     let revoked = f
         .output(
             &[
-                "agent",
                 "run",
-                "--agent",
                 "remote-workspace",
                 "--thread",
                 thread_slug(&first)?,
@@ -1155,9 +1103,7 @@ export default defineHarness({{
     let changed = f
         .output(
             &[
-                "agent",
                 "run",
-                "--agent",
                 "remote-workspace",
                 "--thread",
                 thread_slug(&first)?,
@@ -1407,20 +1353,13 @@ async fn saved_aliases_keep_their_context_after_profile_and_selection_changes() 
     f.cli(&[
         "agent",
         "create",
-        "pinned-context",
-        "--file",
         f.agent_file.to_str().unwrap(),
+        "--name",
+        "pinned-context",
     ])
     .await?;
     let first = f
-        .cli(&[
-            "agent",
-            "run",
-            "--agent",
-            "pinned-context",
-            "--prompt",
-            "hello",
-        ])
+        .cli(&["run", "pinned-context", "--prompt", "hello"])
         .await?;
     let thread = thread_slug(&first)?;
     f.cli(&[
@@ -1442,9 +1381,7 @@ async fn saved_aliases_keep_their_context_after_profile_and_selection_changes() 
     for args in [
         vec!["agent", "get", "pinned-context"],
         vec![
-            "agent",
             "run",
-            "--agent",
             "pinned-context",
             "--thread",
             thread,
@@ -1901,13 +1838,11 @@ async fn models_use_spec_names_and_selected_vault_credentials_locally_and_over_h
         )?;
         std::fs::write(
             &f.agent_file,
-            f.source().replace("gpt-5-mini", "gpt-5.6-sol"),
+            f.source().replace("gpt-5-mini", "gpt-6.1-sol"),
         )?;
         let result = f
             .cli(&[
-                "agent",
                 "run",
-                "--agent-file",
                 f.agent_file.to_str().unwrap(),
                 "--vault",
                 "personal",
@@ -1932,7 +1867,7 @@ async fn models_use_spec_names_and_selected_vault_credentials_locally_and_over_h
         }
         assert_eq!(
             requests[0].body_json::<ModelPayload>()?.model,
-            "gpt-5.6-sol"
+            "gpt-6.1-sol"
         );
         f.cli(&[
             "vault",
@@ -1965,9 +1900,7 @@ async fn models_use_spec_names_and_selected_vault_credentials_locally_and_over_h
             let failed = f
                 .output(
                     &[
-                        "agent",
                         "run",
-                        "--agent-file",
                         f.agent_file.to_str().unwrap(),
                         "--vault",
                         "personal",
@@ -1993,14 +1926,7 @@ async fn models_use_spec_names_and_selected_vault_credentials_locally_and_over_h
             .replace("credential: model-key", "credential: missing");
         std::fs::write(&f.agent_file, missing)?;
         let failed = f
-            .command(&[
-                "agent",
-                "run",
-                "--agent-file",
-                f.agent_file.to_str().unwrap(),
-                "--prompt",
-                "hello",
-            ])
+            .command(&["run", f.agent_file.to_str().unwrap(), "--prompt", "hello"])
             .env("OPENAI_API_KEY", "must-not-be-used")
             .output()
             .await?;

@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     defaults = {
         "dataset": "terminal-bench",
         "dataset_path": None,
-        "model": "gpt-5.5",
+        "model": "gpt-6.1-sol",
         "n_tasks": None,
         "n_attempts": 1,
         "n_concurrent": 1,

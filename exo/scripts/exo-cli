@@ -62,7 +62,7 @@ environment_path = pathlib.Path(environment_path)
 if not environment_path.is_file():
     sys.exit(1)
 environment = json.loads(environment_path.read_text())
-mounts = environment["config"].get("file_system_mounts") or []
+mounts = environment.get("file_system_mounts") or []
 root = pathlib.Path(root).resolve()
 configured = any(
     pathlib.Path(mount["host_path"]).resolve() == root

@@ -54,16 +54,15 @@ exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin 
 
 cat > gameboy.md <<'EOF'
 ---
-name: "Gameboy"
 harness: exoharness/examples/gameboy-agent/agent/harness.ts
-config:
-  model: gpt-5.5
+model:
+  name: gpt-6.1-sol
   credential: openai
   max_tool_round_trips: 20
 ---
 Help the user with their task.
 EOF
-exo agent create gameboy --file gameboy.md
+exo agent create gameboy.md
 exo thread create gameboy "Play Pokemon"
 exo thread send gameboy play "Play Pokemon Red. Get through the intro and pick a starter."
 ```

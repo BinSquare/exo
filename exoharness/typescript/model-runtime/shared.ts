@@ -249,7 +249,7 @@ export async function resolveModel(
   const name = context.agentConfig.credential;
   if (!name) {
     throw new Error(
-      "agent config.credential must name a credential in a selected vault",
+      "agent model.credential must name a credential in a selected vault",
     );
   }
   const idText = name.replace(/^urn:uuid:/i, "").replace(/^\{(.*)\}$/, "$1");
@@ -348,7 +348,10 @@ export async function traceExoharnessToolCall(
     turnParent,
     async (span) => {
       try {
-        const result = await context.executeTool(toolCall.request);
+        const result = await context.executeTool(
+          toolCall.request,
+          toolCall.toolCallId,
+        );
         span.log({ output: result });
         return result;
       } catch (error) {

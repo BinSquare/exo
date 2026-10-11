@@ -15,7 +15,7 @@ EXO_HARNESS = "exo"
 BASIC_HARNESS = "basic"
 PI_HARNESS = "pi"
 
-# `exo thread sandbox attach` reports the new sandbox in prose:
+# `exo sandbox attach` reports the new sandbox in prose:
 # "attached Docker container as sandbox <id> for <conversation>".
 ATTACHED_SANDBOX_ID = re.compile(r"as sandbox (\S+) for ")
 
@@ -90,7 +90,6 @@ class ExoClient:
         from the conversation's configuration.
         """
         arguments = [
-            "thread",
             "sandbox",
             "attach",
             conventions.AGENT_SLUG,

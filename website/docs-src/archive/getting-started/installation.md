@@ -1,9 +1,15 @@
 ---
+search: false
 title: Installation
 description: One setup script to a running agent.
 ---
 
 # Installation
+
+::: warning Archived documentation
+This page describes the earlier Exo self-agent or older APIs and may be out of date. See the [current docs](/).
+These pages use older CLI and configuration syntax. The current local state directory is `~/.exo`; managed agents use `thread fork --up-to` rather than the older clone, rewind, or migrate commands.
+:::
 
 ## Prerequisites
 
@@ -29,7 +35,7 @@ everything:
 
 1. Clones the repository and builds the `exo` CLI.
 2. Asks for your OpenAI API key (stored in a `.env` file with `600`
-   permissions, then registered in exo's secret store).
+   permissions, then registered in Exo's secret store).
 3. Asks for your name and your agent's name, and writes a local profile at
    `.exo/exo-profile.md` (git-ignored — machine-specific instructions
    live here).
@@ -43,7 +49,7 @@ When it finishes, two things happen:
   interface to your agent. Open it in any browser, including your phone.
 - It drops you into a local REPL where you can talk to the agent directly.
 
-Head to [Your First Session](./first-session) for what to try next.
+Head to [Your First Session](first-session) for what to try next.
 
 ## Installing just the CLI
 
@@ -59,11 +65,11 @@ exo --help
 ```
 
 This places a release build at `~/.cargo/bin/exo` (on your `PATH` via
-rustup). See [Using the CLI Directly](./quick-start) to register a model
+rustup). See [Using the CLI Directly](quick-start) to register a model
 and start a bare REPL, and run `pnpm install` if you'll use TypeScript
 harnesses.
 
 ::: info
-  Hacking on exo itself? Use a debug build: `cargo build -p exo`, then invoke
+  Hacking on Exo itself? Use a debug build: `cargo build -p exo`, then invoke
   it as `./target/debug/exo`.
 :::

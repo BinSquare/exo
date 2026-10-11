@@ -1,15 +1,15 @@
 ---
-title: Custom Agent Quickstart
+title: Custom harness
 description: Build a TypeScript harness that reuses built-in tools, adds a custom tool, and customizes context.
 ---
 
-# Custom Agent Quickstart
+# Custom harness
 
 In this tutorial you'll build a small "system monitor" agent as a single
 TypeScript harness module. It covers the three things most custom agents
 need:
 
-1. **Reuse tools that ship with exo** — register the built-in `shell` tool
+1. **Reuse tools that ship with Exo** — register the built-in `shell` tool
    (and its siblings) in one call.
 2. **Add a custom tool** — a `system_info` tool the model can call.
 3. **Customize context building** — the host's live memory utilization is
@@ -31,13 +31,19 @@ Responses-API turn loop:
 
 ```ts
 import { defineHarness } from "@exo/harness";
-import { runResponsesHarnessTurn } from "./turn-loop";
 
-export default defineHarness({
+import { runResponsesHarnessTurn } from "@exo/model-runtime/turn-loop";
+
+const harness = defineHarness({
+  nativeToolApprovals: true,
+  tools: [],
+
   async runTurn(context) {
     await runResponsesHarnessTurn(context);
   },
 });
+
+export default harness;
 ```
 
 That's [`exoharness/examples/typescript/basic-harness.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/typescript/basic-harness.ts)
@@ -49,17 +55,11 @@ customization surface for this tutorial:
 - `registerTools(tools, context)` — populate the tool registry for each model
   round.
 
-## Step 1: reuse tools that ship with exo
+## Step 1: reuse tools that ship with Exo
 
 When you pass a `registerTools` hook, you own the whole registry — so
 built-in tools are opt-in, and you add the ones you want in a single call.
-exo ships three built-ins:
-
-- `shell` — run commands in the conversation's sandbox.
-- `install_agent_tool` / `uninstall_agent_tool` — let the agent write and
-  remove its own TypeScript tools at runtime (they land in
-  `.exo/agent-tools/`). Using these well also needs the agent-tool-creation
-  instruction; see [The Canonical Agent](../concepts/canonical-agent).
+This tutorial uses `shell`, which runs commands in the thread's sandbox.
 
 ```ts
 import {
@@ -72,17 +72,12 @@ async function registerSysmonTools(
   tools: HarnessToolRegistry,
   context: TurnContext,
 ): Promise<void> {
-  registerBuiltInTools(tools, context, [
-    "shell",
-    "install_agent_tool",
-    "uninstall_agent_tool",
-  ]);
+  registerBuiltInTools(tools, context, ["shell"]);
   // ...custom tools go here (Step 2)
 }
 ```
 
-The registry is rebuilt every model round, so a tool the agent installs
-mid-turn via `install_agent_tool` is visible in the very next round.
+The registry is rebuilt every model round.
 
 ## Step 2: add a custom tool
 
@@ -157,7 +152,7 @@ place to inject live context — here, the host's current memory usage:
 
 ```ts
 import { type Message } from "@exo/harness";
-import { basicHarnessInstructions } from "./turn-loop";
+import { basicHarnessInstructions } from "@exo/model-runtime/turn-loop";
 
 function sysmonInstructions(context: TurnContext): Message[] {
   const totalBytes = os.totalmem();
@@ -183,18 +178,17 @@ function gibibytes(bytes: number): string {
 Because the hook re-runs each round, a turn with five tool round-trips sees
 the memory number as of each call, not frozen at the turn's start. (These
 injected messages are rebuilt every round rather than stored in the
-conversation history — see [Data Model](../concepts/data-model) if you
+conversation history — see [Data Model](../architecture/data-model) if you
 want the details on why.)
 
-The same pattern scales to anything derivable: the canonical agent's harness
-([`exo/harness.ts`](https://github.com/exoharness/exo/blob/main/exo/harness.ts))
-uses it to splice in an identity prompt, a git-ignored local profile file,
-and the agent's persistent memory block each round.
+The same pattern works for anything derivable, such as a current inventory
+count or a summary of the thread's saved artifacts.
 
 ## Step 4: put it together
 
 ```ts
 export default defineHarness({
+  nativeToolApprovals: true,
   async runTurn(context) {
     await runResponsesHarnessTurn(context, {
       instructions: sysmonInstructions,
@@ -209,24 +203,23 @@ export default defineHarness({
 ```bash
 pnpm install   # once, for the TypeScript runtime
 
-exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin https://api.openai.com
+exo vault secret create global --preset openai
 
 cat > sysmon.md <<'EOF'
 ---
-name: "Sysmon"
 harness: exoharness/examples/typescript/sysmon-harness.ts
-config:
-  model: gpt-5.5
+model:
+  name: gpt-6.1-sol
   credential: openai
 ---
 Help the user with their task.
 EOF
-exo agent create sysmon --file sysmon.md
+exo agent create sysmon.md
 exo thread create sysmon "Sysmon Test"
-exo agent run --agent sysmon --thread sysmon-test
+exo run sysmon --thread sysmon-test
 ```
 
-A real exchange (via `conversation send`):
+A real exchange (via `thread send`):
 
 ```text
 user: What is your host's current memory utilization? Then call
@@ -253,12 +246,8 @@ tool.
 
 ## Where to go next
 
-- Give a tool per-agent configuration with `initializationParameters`
+- Give a tool configuration with `initializationParameters`
   (see `tools/uppercase.ts`).
-- Ship tools as separate modules and load them with
-  the spec's `tools` list instead of defining them inline.
-- Let the agent create its own tools at runtime by enabling
-  `tool_creation: true` in the spec — the built-in `install_agent_tool` writes tool
-  modules to `.exo/agent-tools/`.
-- Read [Executors & Harnesses](../concepts/executors) for how this
-  module relates to the exoharness underneath it.
+- Ship tools as separate modules and register them with `registerLibraryTools`.
+- Read [Harnesses](../architecture/harnesses) for how this module relates
+  to the exoharness underneath it.

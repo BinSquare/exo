@@ -6,17 +6,17 @@ Run the complete Exo provider over HTTP with OIDC login, private vaults, and opt
 
 One Exo server supports personal access from multiple devices and shared access for a team. Admission and sharing are separate settings.
 
-| Deployment                | Who can log in                 | Agents and threads                                   | Vaults                                                     |
-| ------------------------- | ------------------------------ | ---------------------------------------------------- | ---------------------------------------------------------- |
-| Personal                  | The configured owner           | Private to the owner, available on all their devices | The owner's personal vault                                 |
-| Team                      | Explicitly admitted identities | Private to their creators by default                 | One personal vault per identity                            |
-| Team with `--multiplayer` | The same admitted identities   | Shared among admitted users                          | Personal vaults remain private; shared vaults are explicit |
+| Deployment                | Who can log in                 | Agents and threads                                   | Vaults                                                                          |
+| ------------------------- | ------------------------------ | ---------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Personal                  | The configured owner           | Private to the owner, available on all their devices | Shared `global` plus the owner's personal vault                                 |
+| Team                      | Explicitly admitted identities | Private to their creators by default                 | Shared `global` plus one personal vault per identity                            |
+| Team with `--multiplayer` | The same admitted identities   | Shared among admitted users                          | Shared `global`; personal vaults stay private; other shared vaults are explicit |
 
 Multiplayer shares conversation history, artifacts, and thread files. It does not grant access to another user's credentials. This is a server for trusted members with private data by default, not a hostile multi-tenant hosting service.
 
 ## CLI and HTTP surface
 
-`exo serve` serves the complete local provider. `--agent NAME` filters the same service to one saved agent. Keep adapter supervision in that process, including its existing adapters-only mode. Serving uses the built-in local runtime at `--root` (default `.exo`); creating a named provider profile is optional.
+`exo run --serve` serves the complete local provider. `exo run NAME --serve` filters the same service to one saved agent. Keep adapter supervision in that process, including its existing adapters-only mode. Serving uses the built-in local runtime at `--root` (default `.exo`); creating a named provider profile is optional.
 
 The default bind address is `127.0.0.1:4766`. Without `--auth-file`, authentication is disabled and requests run as the local owner; reject non-loopback binds. Supplying `--auth-file` enables authentication without changing the bind address. A non-loopback listener requires both auth configuration and an explicit `--bind`.
 
@@ -24,17 +24,17 @@ Commands:
 
 ```sh
 # Local use: 127.0.0.1:4766, no authentication.
-exo serve
+exo run --serve
 
 # Authenticated server behind an HTTPS reverse proxy; still binds loopback.
-exo serve --auth-file ./server-auth.yaml
-exo serve --auth-file ./server-auth.yaml --multiplayer
+exo run --serve --auth-file ./server-auth.yaml
+exo run --serve --auth-file ./server-auth.yaml --multiplayer
 
 # On any client device.
 exo provider create personal --url https://exo.example.com/exo
 exo provider login personal
 exo provider switch personal
-exo agent run --agent developer
+exo run developer
 ```
 
 `--auth-file` supplies typed issuer/client configuration, the operator identity, and admitted identities. An operator-owned vault reference supplies an OAuth client secret if needed; that vault is never automatically attached to user runs. Parse every option and environment-variable binding through Clap. Do not reintroduce a server `--token-env` option or implicit environment reads.
@@ -45,7 +45,7 @@ Complete the same HTTP contract used by `RuntimeClient`: identity; agents and de
 
 ## Authentication
 
-Run authentication inside the existing Rust `exo serve` process, using the same HTTP listener and local state. Connect directly to the configured Google/OIDC provider. The MVP setup is explicit: the operator registers a Google app and callback URL, stores its client secret in a vault, writes one auth config file, and starts Exo. No shared login service, additional auth deployment, or setup wizard.
+Run authentication inside the existing Rust `exo run --serve` process, using the same HTTP listener and local state. Connect directly to the configured Google/OIDC provider. The MVP setup is explicit: the operator registers a Google app and callback URL, stores its client secret in a vault, writes one auth config file, and starts Exo. No shared login service, additional auth deployment, or setup wizard.
 
 `openidconnect` handles discovery, code exchange, and signed identity-token validation; `oxide-auth` supplies the S256 PKCE verifier. Exo implements the CLI-facing registration, authorization-code, token, and revocation endpoints, persisting sessions and ownership through the existing encrypted vault store. These handlers share the runtime HTTP listener.
 
@@ -97,7 +97,7 @@ Register one Google OAuth client per Exo deployment. Individual users and CLI in
 
 #### 2. Store the Google client secret
 
-`exo serve` defaults to the same `.exo` state directory as the local CLI; no separate state directory or `--config-dir` is needed. Run these commands on the server host from its working directory, using the built-in local provider and default `.exo` state. No provider profile needs to be created. Check `exo provider` first; if a saved profile is selected, clear that selection in the scope it reports before importing the secret. Import the client secret with `GOOGLE_CLIENT_SECRET` set locally to the value copied from Google:
+`exo run --serve` defaults to the same `.exo` state directory as the local CLI; no separate state directory or `--config-dir` is needed. Run these commands on the server host from its working directory, using the built-in local provider and default `.exo` state. No provider profile needs to be created. Check `exo provider` first; if a saved profile is selected, clear that selection in the scope it reports before importing the secret. Import the client secret with `GOOGLE_CLIENT_SECRET` set locally to the value copied from Google:
 
 ```sh
 exo vault create server-auth
@@ -140,10 +140,10 @@ Email entries are enrollment selectors: require a validated Google identity with
 Server command, run from the same directory as the vault import:
 
 ```sh
-exo serve --auth-file ./server-auth.yaml
+exo run --serve --auth-file ./server-auth.yaml
 ```
 
-Use the same `--root` on vault and serve commands if choosing a state directory other than `.exo`. A named local provider is only a convenience for saving that path.
+Use the same `--root` on vault and serve commands if choosing a state directory other than `~/.exo`. A named local provider is only a convenience for saving that path.
 
 Validate the required auth settings and resolve the client-secret reference before accepting requests. Report missing settings or inaccessible secrets directly, and print the expected Google callback URL at startup.
 
@@ -169,15 +169,15 @@ Persist a small record in the server's existing state:
 
 - After authentication and admission succeed, atomically look up or create the principal and its personal vault. Concurrent first logins must not create duplicate vaults.
 - Returning users and additional devices reuse the same association. Display the default vault as `personal`; its stored ID is the authority, not its display name.
-- Existing local vaults remain owned by the configured server owner and keep their IDs. They are available for explicit attachment; they are not automatically attached. Rebinding a personal vault to a different existing vault remains a local-operator follow-up.
+- Existing local vaults remain owned by the configured server owner and keep their IDs. `global` is automatically inherited by every thread; other local vaults require explicit attachment. Rebinding a personal vault to a different existing vault remains a local-operator follow-up.
 - New personal vaults start empty. Users add model credentials or connect MCP services once, using the existing vault/OAuth flow.
-- Additional vaults created by a user belong to that principal. Optional `shared_vaults: [team]` in the auth config grants use to admitted users; only the owner manages their credentials. Shared vaults must be explicitly attached, and their credentials must have an HTTP or MCP destination to be used by another principal. Raw secret reads and credential management remain with the owner. Auth and personal vaults cannot be shared.
+- Additional vaults created by a user belong to that principal. Optional `shared_vaults: [team]` in the auth config grants use to admitted users; only the owner manages their credentials. Other shared vaults must be explicitly attached, and their credentials must have an HTTP or MCP destination to be used by another principal. Raw secret reads and credential management remain with the owner. Auth and personal vaults cannot be shared.
 
-Authentication produces a caller-scoped `VaultContext` containing the personal vault and explicitly granted shared vaults. Attachments and persisted secret references must be checked against that context on every use. A client-supplied vault ID, a shared agent, or a saved thread is not an authorization grant.
+Authentication produces a caller-scoped `VaultContext` containing the shared server-wide `global` vault, the personal vault, and explicitly attached permitted vaults. Personal credentials take precedence over `global`, and explicit attachments take precedence over both. Attachments and persisted secret references must be checked against that context on every use. A client-supplied vault ID, a shared agent, or a saved thread is not an authorization grant.
 
 Keep `VaultHandle`, secret IDs, encryption, OAuth refresh, destination checks, rotation, revocation, and credential substitution as the implementation. Custom providers and external vault backends can supply their own principal-to-context mapping.
 
-Existing local state needs an explicit owner assignment when enabling auth. Preserve vault/agent/thread IDs and account aliases; make the assignment restart-safe. Do not expose an existing local `global` vault to newly admitted users by default.
+Existing local state needs an explicit owner assignment when enabling auth. Preserve vault/agent/thread IDs and account aliases; make the assignment restart-safe. The server-wide `global` vault is shared with all admitted users for credential use; writes and raw secret reads stay with its owner. Store authentication secrets in a separate operator-only vault.
 
 ## Private and multiplayer execution
 
@@ -197,7 +197,7 @@ Deferred until the remote CLI workflow is complete. This phase includes only the
 
 ## Implementation sequence and acceptance
 
-1. **Namespace and serving.** `/exo` is the only OSS managed API namespace; move the command to `exo serve` and keep one service implementation. Verify the existing HTTP client against full-provider and agent-filtered servers. The raw `/request` route stays absent.
+1. **Namespace and serving.** `/exo` is the only OSS managed API namespace; move the command to `exo run --serve` and keep one service implementation. Verify the existing HTTP client against full-provider and agent-filtered servers. The raw `/request` route stays absent.
 2. **Embedded login and personal vaults.** Prove the provider-login contract above against direct Google/OIDC from one Exo process, using the existing CLI. Cover browser login, session refresh/logout across restart, stable identity, atomic vault provisioning, and explicit adoption of existing local state. Verify that two devices get the same vault, two identities get different vaults, and rejected identities create no state.
 3. **Authorized provider operations.** Finish remote vault CRUD and private-mode enforcement using caller-scoped handles. Exercise agents, threads, artifacts, history/SSE, cancellation, approvals, environments, and vault operations as two users, including direct-ID requests and revoked access. Keep this in one enforcement path shared with non-HTTP execution.
 4. **Multiplayer.** Add the server flag and exercise two users continuing the same thread. Verify shared history, separate credential selection, caller-only approvals, revoked grants, and no credential/session reuse across principals. Test restart, background jobs, and switching sharing mode without losing creator metadata.

@@ -1033,15 +1033,14 @@ external network call:
 ```bash
 cat > irc-agent.md <<'EOF'
 ---
-name: "IRC Agent"
 harness: basic
-config:
-  model: gpt-5.4
+model:
+  name: gpt-5.4
   credential: openai
 ---
 Help the user with their task.
 EOF
-exo agent create irc-agent --file irc-agent.md
+exo agent create irc-agent.md
 ```
 
 If the IRC server requires a password or NickServ token, store it as a normal

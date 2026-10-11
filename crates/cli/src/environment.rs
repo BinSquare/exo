@@ -42,7 +42,7 @@ pub fn load(path: &Path) -> Result<EnvironmentDefinition> {
         .with_context(|| format!("reading environment {}", path.display()))?;
     let mut definition: EnvironmentDefinition =
         serde_yaml_ng::from_str(&source).context("invalid environment definition")?;
-    for mount in definition.config.file_system_mounts.iter_mut().flatten() {
+    for mount in definition.file_system_mounts.iter_mut().flatten() {
         let host_path = Path::new(&mount.host_path);
         if host_path.is_relative() {
             let base = path.parent().context("environment file has no parent")?;
@@ -379,10 +379,10 @@ mod tests {
         let file = environments.join("dev.yaml");
         std::fs::write(
             &file,
-            "name: dev\nconfig:\n  image: dev\n  file_system_mounts:\n    - host_path: ../scripts\n      mount_path: /opt/scripts\n      mode: ro\n",
+            "name: dev\nimage: dev\nfile_system_mounts:\n  - host_path: ../scripts\n    mount_path: /opt/scripts\n    mode: ro\n",
         )?;
         let environment = load(&file)?;
-        let mounts = environment.config.file_system_mounts.context("mounts")?;
+        let mounts = environment.file_system_mounts.context("mounts")?;
         assert_eq!(
             Path::new(&mounts[0].host_path),
             scripts.canonicalize()?.as_path()
@@ -397,10 +397,10 @@ mod tests {
         let file = directory.path().join("environment.yaml");
         std::fs::write(
             &file,
-            "name: support-analyst-env\nconfig:\n  image: ghcr.io/exoharness/codex-sandbox:latest\n",
+            "name: support-analyst-env\nimage: ghcr.io/exoharness/codex-sandbox:latest\n",
         )?;
         let environment = load(&file)?;
-        assert_eq!(environment.config.provider, SandboxProvider::Smolvm);
+        assert_eq!(environment.provider, SandboxProvider::Smolvm);
         Ok(())
     }
 }

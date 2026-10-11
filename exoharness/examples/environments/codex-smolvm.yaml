@@ -1,12 +1,10 @@
 name: codex-smolvm
-config:
-  provider: smolvm
-  image: ghcr.io/exoharness/codex-devbox:latest
-  resources:
-    vcpu_count: 2
-    memory_mib: 1024
-  default_workdir: /workspace
-  policy:
-    networking:
-      type: unrestricted
-  idle_seconds: 600
+provider: smolvm
+image: ghcr.io/exoharness/codex-devbox:latest
+resources:
+  vcpu_count: 2
+  memory_mib: 1024
+default_workdir: /workspace
+networking:
+  type: unrestricted
+idle_seconds: 600

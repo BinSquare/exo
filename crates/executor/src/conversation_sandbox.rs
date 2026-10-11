@@ -120,7 +120,7 @@ pub async fn ensure_conversation_sandbox(
         }
     }
 
-    create_sandbox(conversation, config, spec, policy).await
+    create_sandbox(conversation, spec, policy).await
 }
 
 pub async fn attached_conversation_sandbox(
@@ -241,22 +241,18 @@ pub(crate) async fn create_conversation_sandbox(
 ) -> Result<String> {
     let spec = conversation_sandbox_spec(agent_config, config);
     let policy = sandbox_policy(conversation, agent_config, config).await?;
-    create_sandbox(conversation, config, spec, policy).await
+    create_sandbox(conversation, spec, policy).await
 }
 
 async fn create_sandbox(
     conversation: &dyn ConversationHandle,
-    config: &ConversationConfig,
     spec: ConversationSandboxSpec,
     policy: Option<exoharness::EgressPolicy>,
 ) -> Result<String> {
     conversation
         .create_sandbox(CreateSandboxRequest {
             tcp_ports: spec.tcp_ports,
-            name: config
-                .environment
-                .as_ref()
-                .and_then(|env| env.config.name.clone()),
+            name: None,
             provider: spec.provider,
             image: spec.image,
             resources: spec.resources,
@@ -315,7 +311,7 @@ pub(crate) fn conversation_sandbox_spec(
     agent_config: &AgentConfig,
     config: &ConversationConfig,
 ) -> ConversationSandboxSpec {
-    let environment = config.environment.as_ref().map(|env| &env.config);
+    let environment = config.environment.as_ref();
     ConversationSandboxSpec {
         provider: config.effective_sandbox_provider(agent_config),
         image: config
@@ -349,7 +345,7 @@ pub(crate) fn conversation_sandbox_spec(
         resources: environment.and_then(|env| env.resources),
         enable_networking: environment
             .and_then(|env| {
-                env.policy
+                env.policy()
                     .as_ref()
                     .map(|policy| policy.networking_enabled())
                     .or(env.enable_networking)
@@ -407,7 +403,7 @@ mod tests {
                 .await?;
         let agent = exoharness::test_support::new_test_agent(&harness, "previews").await?;
         let mut environment: exoharness::EnvironmentDefinition = serde_json::from_str(
-            r#"{"name":"web","config":{"provider":"local_process","image":"unused","tcp_ports":[3000],"enable_networking":true}}"#,
+            r#"{"name":"web","provider":"local_process","image":"unused","tcp_ports":[3000],"enable_networking":true}"#,
         )?;
         let thread = agent
             .new_thread(exoharness::NewThreadRequest {
@@ -416,7 +412,7 @@ mod tests {
             })
             .await?;
         let definition = exo_managed_agents::AgentDefinition::parse(
-            "---\nname: previews\nharness: basic\nconfig:\n  model: test\n---\nUse tools.".into(),
+            "---\nname: previews\nharness: basic\nmodel:\n  name: test\n---\nUse tools.".into(),
         )?;
         let agent_config = crate::managed_agents::agent_config(
             &definition,
@@ -433,7 +429,7 @@ mod tests {
         thread.stop_sandbox(first.clone()).await?;
         assert_eq!(thread.list_sandboxes().await?[0].id, first);
         assert!(!thread.list_sandboxes().await?[0].running);
-        environment.config.image = "replacement".into();
+        environment.image = "replacement".into();
         let thread = thread.update_environment(environment.clone()).await?;
         assert!(thread.list_sandboxes().await?.is_empty());
         config.environment = Some(environment);
@@ -458,7 +454,7 @@ mod tests {
         let agent = exoharness::test_support::new_test_agent(&harness, "ports").await?;
         let thread = agent.new_thread(Default::default()).await?;
         let definition = exo_managed_agents::AgentDefinition::parse(
-            "---\nname: ports\nharness: basic\nconfig:\n  model: test\n---\nUse tools.".into(),
+            "---\nname: ports\nharness: basic\nmodel:\n  name: test\n---\nUse tools.".into(),
         )?;
         let agent_config = crate::managed_agents::agent_config(
             &definition,
@@ -468,7 +464,7 @@ mod tests {
         )?;
         let mut config = ConversationConfig {
             environment: Some(serde_json::from_str(
-                r#"{"name":"web","config":{"provider":"local_process","image":"unused","tcp_ports":[3000,8000],"enable_networking":true}}"#,
+                r#"{"name":"web","provider":"local_process","image":"unused","tcp_ports":[3000,8000],"enable_networking":true}"#,
             )?),
             ..Default::default()
         };
@@ -502,19 +498,13 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].running);
 
-        config
-            .environment
-            .as_mut()
-            .unwrap()
-            .config
-            .tcp_ports
-            .push(8788);
+        config.environment.as_mut().unwrap().tcp_ports.push(8788);
         let second =
             ensure_conversation_sandbox(thread.as_ref(), &agent_config, &config, None).await?;
         assert_ne!(first, second);
         let sandboxes = conversation_sandboxes(thread.as_ref()).await?;
         assert_eq!(sandboxes[1].tcp_ports, vec![3000, 8000, 8788]);
-        config.environment.as_mut().unwrap().config.resources =
+        config.environment.as_mut().unwrap().resources =
             exoharness::SandboxResourceShape::new(4, 4096);
         let resized =
             ensure_conversation_sandbox(thread.as_ref(), &agent_config, &config, None).await?;
@@ -544,7 +534,7 @@ mod tests {
         let unattached = agent.new_thread(Default::default()).await?;
         let thread = unattached.attach_vaults(vec![vault.record().id]).await?;
         for (harness_name, model, variable, host) in [
-            ("codex", "gpt-5.6-sol", "OPENAI_API_KEY", "api.openai.com"),
+            ("codex", "gpt-6.1-sol", "OPENAI_API_KEY", "api.openai.com"),
             (
                 "claude-code",
                 "claude-sonnet-4-6",
@@ -559,7 +549,7 @@ mod tests {
             ),
         ] {
             let definition = exo_managed_agents::AgentDefinition::parse(format!(
-                "---\nname: test\nharness: {harness_name}\nconfig:\n  model: {model}\n  credential: {harness_name}\n---\nHelp."
+                "---\nharness: {harness_name}\nmodel:\n  name: {model}\n  credential: {harness_name}\n---\nHelp."
             ))?;
             let mut agent_config = crate::managed_agents::agent_config(
                 &definition,
@@ -666,7 +656,7 @@ mod tests {
             .await?;
         let thread = agent.new_thread(NewThreadRequest::default()).await?;
         let definition = exo_managed_agents::AgentDefinition::parse(
-            "---\nname: test\nharness: basic\nconfig:\n  model: test\n---\nUse tools.".into(),
+            "---\nharness: basic\nmodel:\n  name: test\n---\nUse tools.".into(),
         )?;
         let mut agent_config =
             crate::managed_agents::agent_config(&definition, SandboxProvider::Docker, None, None)?;
@@ -674,7 +664,7 @@ mod tests {
         let resource = exoharness::resources::PreparedResource {
             definition: exoharness::resources::ResourceDefinition {
                 name: "code".into(),
-                mount_path: "/workspace".into(),
+                mount_path: Some("/workspace".into()),
                 mode: FileSystemMountMode::ReadWrite,
                 source: exoharness::resources::ResourceSource::GitRepository {
                     path: None,
@@ -726,7 +716,7 @@ mod tests {
         );
         config.environment = Some(exoharness::EnvironmentDefinition {
             name: "restricted".into(),
-            config: exoharness::CreateSandboxRequest {
+            ..(exoharness::CreateSandboxRequest {
                 tcp_ports: vec![],
                 provider: SandboxProvider::Docker,
                 image: "test".into(),
@@ -743,7 +733,8 @@ mod tests {
                 ),
                 enable_networking: None,
                 idle_seconds: None,
-            },
+            })
+            .into()
         });
         assert!(
             sandbox_policy(thread.as_ref(), &agent_config, &config)
@@ -752,15 +743,14 @@ mod tests {
                 .to_string()
                 .contains("not allowed")
         );
-        let policy = config
+        let networking = config
             .environment
             .as_mut()
             .unwrap()
-            .config
-            .policy
+            .networking
             .as_mut()
             .unwrap();
-        policy.networking = SandboxNetworkPolicy::Limited {
+        *networking = SandboxNetworkPolicy::Limited {
             allowed_hosts: vec!["github.com".into()],
         };
         assert!(
@@ -770,17 +760,9 @@ mod tests {
                 .to_string()
                 .contains("api.github.com")
         );
-        config
-            .environment
-            .as_mut()
-            .unwrap()
-            .config
-            .policy
-            .as_mut()
-            .unwrap()
-            .networking = SandboxNetworkPolicy::Limited {
+        config.environment.as_mut().unwrap().networking = Some(SandboxNetworkPolicy::Limited {
             allowed_hosts: vec!["github.com".into(), "api.github.com".into()],
-        };
+        });
         sandbox_policy(thread.as_ref(), &agent_config, &config).await?;
         config.environment = None;
         agent_config.sandbox.enable_networking = false;

@@ -1,4 +1,6 @@
 import { defineConfig } from "vitepress";
+import { eventKindsMarkdown } from "./event-kinds";
+import { darkTheme, lightTheme } from "./shiki-themes";
 
 // Docs are served under exoharness.ai/docs by the Cloudflare Worker in
 // website/. `vitepress build` emits static files straight into website/dist/docs
@@ -9,81 +11,116 @@ export default defineConfig({
   outDir: "../dist/docs",
   cleanUrls: true,
   lang: "en",
-  title: "exo docs",
-  description: "Documentation for exo — a minimal system for building agents.",
-  appearance: "dark",
+  title: "Exo docs",
+  description: "Exo is an open source runtime for agents.",
+  markdown: {
+    theme: { light: lightTheme, dark: darkTheme },
+    config(md) {
+      md.core.ruler.before("normalize", "exo-event-kinds", (state) => {
+        state.src = state.src.replace("<!-- EXO_EVENT_KINDS -->", eventKindsMarkdown);
+      });
+    },
+  },
   head: [
     ["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
   ],
   themeConfig: {
     logo: {
-      light: "/images/exo-badge-light.svg",
-      dark: "/images/exo-badge-dark.svg",
+      light: "/images/exo-badge-dark.svg",
+      dark: "/images/exo-badge-light.svg",
     },
-    siteTitle: "exo",
+    siteTitle: "Exo",
+    logoLink: { link: "/", target: "_self" },
     nav: [
-      { text: "Home", link: "/" },
       { text: "GitHub", link: "https://github.com/exoharness/exo" },
+      { text: "Discord", link: "https://discord.gg/8x23hdBJU6" },
     ],
     search: { provider: "local" },
-    socialLinks: [{ icon: "github", link: "https://github.com/exoharness/exo" }],
-    sidebar: [
-      { text: "Overview", link: "/" },
-      {
-        text: "Getting Started",
-        link: "/getting-started/",
-        collapsed: false,
-        items: [
-          { text: "Installation", link: "/getting-started/installation" },
-          { text: "Your First Session", link: "/getting-started/first-session" },
-          { text: "Using the CLI Directly", link: "/getting-started/quick-start" },
-          {
-            text: "A Sandboxed Conversation",
-            link: "/getting-started/sandboxed-conversation",
-          },
-        ],
-      },
-      {
-        text: "Concepts",
-        link: "/concepts/",
-        collapsed: false,
-        items: [
-          {
-            text: "Exoharness & Executor",
-            link: "/concepts/exoharness-and-executor",
-          },
-          { text: "Data Model", link: "/concepts/data-model" },
-          { text: "Lifecycles", link: "/concepts/lifecycles" },
-          { text: "Time Travel", link: "/concepts/time-travel" },
-          { text: "Sandboxes", link: "/concepts/sandboxes" },
-          {
-            text: "Bindings & Secrets",
-            link: "/concepts/bindings-and-secrets",
-          },
-          { text: "Executors & Harnesses", link: "/concepts/executors" },
-          { text: "Tools", link: "/concepts/tools" },
-          { text: "Adapters", link: "/concepts/adapters" },
-          { text: "Task Scheduler", link: "/concepts/task-scheduler" },
-          { text: "The Canonical Agent", link: "/concepts/canonical-agent" },
-        ],
-      },
-      {
-        text: "Tutorials",
-        link: "/tutorials/",
-        collapsed: false,
-        items: [
-          {
-            text: "Custom Agent Quickstart",
-            link: "/tutorials/write-your-own-agent",
-          },
-          { text: "Custom Coding Agent", link: "/tutorials/custom-coding-agent" },
-          {
-            text: "Game & Third-Party Tool Integration",
-            link: "/tutorials/game-emulator-integration",
-          },
-        ],
-      },
-      { text: "Development", link: "/development/" },
-    ],
+    sidebar: {
+      "/archive/": [
+        { text: "Current docs", link: "/" },
+        { text: "Archive", link: "/archive/" },
+        { text: "Earlier overview", link: "/archive/overview" },
+        {
+          text: "Getting started",
+          link: "/archive/getting-started/",
+          collapsed: true,
+          items: [
+            {
+              text: "Installation",
+              link: "/archive/getting-started/installation",
+            },
+            {
+              text: "Your first session",
+              link: "/archive/getting-started/first-session",
+            },
+            {
+              text: "Using the CLI directly",
+              link: "/archive/getting-started/quick-start",
+            },
+            {
+              text: "A sandboxed conversation",
+              link: "/archive/getting-started/sandboxed-conversation",
+            },
+          ],
+        },
+        {
+          text: "Concepts",
+          link: "/archive/concepts/",
+          collapsed: true,
+          items: [
+            {
+              text: "Self-agent lifecycles",
+              link: "/archive/concepts/lifecycles",
+            },
+            { text: "Self-agent tools", link: "/archive/concepts/tools" },
+            { text: "Adapters", link: "/archive/concepts/adapters" },
+            {
+              text: "Task scheduler",
+              link: "/archive/concepts/task-scheduler",
+            },
+            {
+              text: "The canonical agent",
+              link: "/archive/concepts/canonical-agent",
+            },
+          ],
+        },
+      ],
+      "/": [
+        { text: "Overview", link: "/" },
+        { text: "Agent definition", link: "/agent-definition" },
+        {
+          text: "Tutorials",
+          link: "/tutorials/",
+          collapsed: false,
+          items: [
+            { text: "Support agent", link: "/tutorials/support-agent" },
+            {
+              text: "Custom harness",
+              link: "/tutorials/write-your-own-agent",
+            },
+            {
+              text: "Custom coding agent",
+              link: "/tutorials/custom-coding-agent",
+            },
+            {
+              text: "Game integration",
+              link: "/tutorials/game-emulator-integration",
+            },
+          ],
+        },
+        {
+          text: "Architecture",
+          collapsed: false,
+          items: [
+            { text: "Harnesses", link: "/architecture/harnesses" },
+            { text: "Data model", link: "/architecture/data-model" },
+            { text: "Sandboxes", link: "/architecture/sandboxes" },
+            { text: "Vaults", link: "/architecture/vaults" },
+          ],
+        },
+        { text: "Development", link: "/development/" },
+      ],
+    },
   },
 });

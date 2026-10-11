@@ -120,11 +120,8 @@ fn launcher_creates_and_updates_a_thread_environment_with_the_current_cli() -> R
             &fs::read_to_string(launch.join(".exo/launch-environment.json"))?,
         )?;
         environment.validate()?;
-        assert_eq!(environment.config.image, image);
-        assert_eq!(
-            environment.config.enable_networking,
-            Some(networking == "enabled")
-        );
+        assert_eq!(environment.image, image);
+        assert_eq!(environment.enable_networking, Some(networking == "enabled"));
         let mut mounts = vec![exoharness::FileSystemMount {
             host_path: fs::canonicalize(&launch)?.display().to_string(),
             mount_path: "/workspace/exo source".to_string(),
@@ -139,15 +136,12 @@ fn launcher_creates_and_updates_a_thread_environment_with_the_current_cli() -> R
                 internal: None,
             });
         }
-        assert_eq!(
-            environment.config.file_system_mounts.as_ref(),
-            Some(&mounts)
-        );
+        assert_eq!(environment.file_system_mounts.as_ref(), Some(&mounts));
         // A normal resume must retain the saved mounts without launch overrides.
         run(Command::new(&wrapper)
             .current_dir(&launch)
             .env("PATH", &path)
-            .args(["agent", "run", "--agent", "exo-agent", "--thread", "dev"]))?;
+            .args(["run", "exo-agent", "--thread", "dev"]))?;
         let state = exoharness::BasicExoHarnessConfig {
             root: temp.path().join("state/exoharness"),
             secret_backend: exoharness::SecretBackendChoice::File {

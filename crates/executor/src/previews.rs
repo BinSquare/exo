@@ -40,7 +40,7 @@ pub fn previews_for(
     let Some(environment) = thread
         .environment
         .as_ref()
-        .filter(|env| !env.config.tcp_ports.is_empty())
+        .filter(|env| !env.tcp_ports.is_empty())
     else {
         return Ok(None);
     };
@@ -73,7 +73,6 @@ pub fn previews_for(
         page: format!("http://{host}"),
         host: host.clone(),
         services: environment
-            .config
             .tcp_ports
             .iter()
             .copied()

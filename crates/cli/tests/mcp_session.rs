@@ -84,7 +84,7 @@ async fn vault_credentials_stay_host_side_and_typescript_preserves_oauth_refresh
     std::fs::write(
         &definition,
         format!(
-            "---\nname: test-agent\nharness: {}\nconfig:\n  model: fixture\nmcp_servers:\n  - type: url\n    name: fixture\n    url: {}\n---\nTest credentials.\n",
+            "---\nharness: {}\nmodel:\n  name: fixture\nmcp_servers:\n  - type: url\n    name: fixture\n    url: {}\n---\nTest credentials.\n",
             module.display(),
             server.uri()
         ),
@@ -115,9 +115,9 @@ async fn vault_credentials_stay_host_side_and_typescript_preserves_oauth_refresh
         vec![
             "agent",
             "create",
-            "saved",
-            "--file",
             definition.to_str().unwrap(),
+            "--name",
+            "saved",
         ],
         vec![
             "conversation",
@@ -175,18 +175,16 @@ async fn vault_credentials_stay_host_side_and_typescript_preserves_oauth_refresh
         (true, 2, 3),
     ] {
         revision.store(version, Ordering::SeqCst);
-        let mut cmd = command("agent");
-        cmd.arg("run");
+        let mut cmd = command("run");
         if saved {
             cmd.arg("--env-file").arg(&env_file);
         }
-        cmd.arg(if saved { "--agent" } else { "--agent-file" })
-            .arg(if saved {
-                "saved"
-            } else {
-                definition.to_str().unwrap()
-            })
-            .args(["--prompt", "test"]);
+        cmd.arg(if saved {
+            "saved"
+        } else {
+            definition.to_str().unwrap()
+        })
+        .args(["--prompt", "test"]);
         if saved {
             cmd.args(["--thread", "history"]);
         }

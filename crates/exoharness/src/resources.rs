@@ -1,4 +1,7 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Component, Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -8,7 +11,8 @@ use crate::FileSystemMountMode;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceDefinition {
     pub name: String,
-    pub mount_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<String>,
     #[serde(default = "writable")]
     pub mode: FileSystemMountMode,
     #[serde(flatten)]
@@ -21,23 +25,17 @@ pub enum ResourceSource {
     Directory {
         path: PathBuf,
     },
+    #[serde(rename = "git")]
     GitRepository {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        checkout: Option<GitCheckout>,
+        checkout: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum GitCheckout {
-    Branch { name: String },
-    Commit { sha: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +48,7 @@ pub struct PreparedResource {
 impl PreparedResource {
     pub fn same_workspace(&self, other: &Self) -> bool {
         let mut definition = self.definition.clone();
+        definition.mount_path = other.definition.mount_path.clone();
         if let (
             ResourceSource::GitRepository { credential, .. },
             ResourceSource::GitRepository {
@@ -60,7 +59,9 @@ impl PreparedResource {
         {
             *credential = other_credential.clone();
         }
-        self.snapshot == other.snapshot && definition == other.definition
+        self.snapshot == other.snapshot
+            && self.definition.mount_path() == other.definition.mount_path()
+            && definition == other.definition
     }
 }
 
@@ -69,6 +70,13 @@ fn writable() -> FileSystemMountMode {
 }
 
 impl ResourceDefinition {
+    pub fn mount_path(&self) -> Cow<'_, str> {
+        match &self.mount_path {
+            Some(path) => Cow::Borrowed(path),
+            None => Cow::Owned(format!("/workspace/{}", self.name)),
+        }
+    }
+
     pub fn git_credential_variable(&self) -> String {
         let name: String = self
             .name
@@ -108,14 +116,20 @@ impl ResourceDefinition {
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')),
             "resource names may only contain letters, numbers, '-' and '_'"
         );
-        let mount = Path::new(&self.mount_path);
+        ensure!(
+            self.mount_path.is_some()
+                || matches!(self.source, ResourceSource::GitRepository { .. }),
+            "directory resources require mount_path"
+        );
+        let mount_path = self.mount_path();
+        let mount = Path::new(mount_path.as_ref());
         ensure!(
             mount.is_absolute()
                 && mount != Path::new("/")
                 && mount
                     .components()
                     .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
-                && !self.mount_path.contains(['\0', ':']),
+                && !mount_path.contains(['\0', ':']),
             "resource mount_path must be an absolute path without '..', ':' or NUL"
         );
         match &self.source {
@@ -131,7 +145,7 @@ impl ResourceDefinition {
             } => {
                 ensure!(
                     path.is_some() != url.is_some(),
-                    "git_repository requires exactly one of path or url"
+                    "git resources require exactly one of path or url"
                 );
                 if let Some(path) = path {
                     ensure!(
@@ -156,19 +170,17 @@ impl ResourceDefinition {
                     );
                 }
                 if let Some(checkout) = checkout {
-                    match checkout {
-                        GitCheckout::Branch { name } => ensure!(
-                            !name.is_empty()
-                                && !name.starts_with('-')
-                                && !name.contains(['\0', '\n', '\r']),
-                            "invalid Git branch"
-                        ),
-                        GitCheckout::Commit { sha } => ensure!(
-                            matches!(sha.len(), 40 | 64)
-                                && sha.bytes().all(|c| c.is_ascii_hexdigit()),
-                            "Git commits must be full hexadecimal object IDs"
-                        ),
-                    }
+                    ensure!(
+                        !checkout.is_empty()
+                            && !checkout.starts_with('-')
+                            && !checkout
+                                .chars()
+                                .any(|c| c.is_control() || c.is_whitespace())
+                            && !checkout.contains(['~', '^', ':', '?', '*', '[', '\\'])
+                            && !checkout.contains("..")
+                            && !checkout.contains("@{"),
+                        "checkout must be a Git branch, tag, or full commit ID"
+                    );
                 }
             }
         }
@@ -185,7 +197,7 @@ pub fn validate_resources(resources: &[ResourceDefinition]) -> Result<()> {
                 "duplicate resource name: {}",
                 resource.name
             );
-            validate_mount_overlap(&resource.mount_path, &other.mount_path)?;
+            validate_mount_overlap(&resource.mount_path(), &other.mount_path())?;
         }
     }
     Ok(())

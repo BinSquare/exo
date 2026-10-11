@@ -1,9 +1,15 @@
 ---
+search: false
 title: Lifecycles
 description: How agents, conversations, sandboxes, and adapters start, stay up, change, and stop.
 ---
 
 # Lifecycles
+
+::: warning Archived documentation
+This page describes the earlier Exo self-agent or older APIs and may be out of date. See the [current docs](/).
+These pages use older CLI and configuration syntax. The current local state directory is `~/.exo`; managed agents use `thread fork --up-to` rather than the older clone, rewind, or migrate commands.
+:::
 
 Exo's components have different lifetimes and ownership rules. This page
 covers the four that matter most in practice:
@@ -13,8 +19,8 @@ covers the four that matter most in practice:
 - [Sandboxes](#sandbox-lifecycle) — create, start/stop, attach/detach, snapshot
 - [Adapters](#adapter-lifecycle) — host workers, supervision, and wakeups
 
-For what each object *is*, see [Data Model](./data-model). For backends and
-scope defaults, see [Sandboxes](./sandboxes) and [Adapters](./adapters).
+For what each object *is*, see [Data Model](../../architecture/data-model). For backends and
+scope defaults, see [Sandboxes](/architecture/sandboxes) and [Adapters](adapters).
 
 ## Mental model
 
@@ -46,7 +52,6 @@ bindings, and secrets.
 ```bash
 cat > my-agent.md <<'EOF'
 ---
-name: "My Agent"
 harness: basic
 config:
   model: gpt-5.6-terra
@@ -181,7 +186,7 @@ exo thread fork <agent> <conversation> "Fork Name"
 Fork branches a **new** conversation from an existing one (optionally up
 to a given event). Secrets and bindings remain available; the new
 conversation gets its own log from the fork point forward. See
-[Time Travel](./time-travel).
+[Time Travel](/architecture/data-model#forking-history).
 
 ### Idle, resume, stop
 
@@ -310,7 +315,7 @@ Agent tools: `snapshot_sandbox`, `list_sandbox_snapshots`, `rewind_sandbox`.
 Important distinctions:
 
 - Snapshot/rewind moves **filesystem** state, not the conversation log.
-- Conversation fork/rewind is a separate axis ([Time Travel](./time-travel)).
+- Conversation fork/rewind is a separate axis ([Time Travel](/architecture/data-model#forking-history)).
 - Snapshots of attached vs created sandboxes depend on backend support;
   treat attach as “execute here,” not necessarily “full snapshot parity.”
 
@@ -331,7 +336,7 @@ Important distinctions:
 | `conversation` | Sandbox tied to that conversation's event log and candidates. |
 
 Scheduler tasks can also use `task_fresh` — a sandbox reused across that
-task's runs only. See [Task Scheduler](./task-scheduler).
+task's runs only. See [Task Scheduler](task-scheduler).
 
 ---
 
@@ -439,9 +444,9 @@ evolve without erasing how it got here.
 
 ## Related
 
-- [Data Model](./data-model) — agents, conversations, sessions, turns, events
-- [Sandboxes](./sandboxes) — backends and scope
-- [Adapters](./adapters) — channel setup and configuration
-- [Task Scheduler](./task-scheduler) — recurring work and wakeups
-- [Time Travel](./time-travel) — fork and snapshot semantics
-- [The Canonical Agent](./canonical-agent) — how `./exo.sh` wires these together
+- [Data Model](../../architecture/data-model) — agents, conversations, sessions, turns, events
+- [Sandboxes](/architecture/sandboxes) — backends and scope
+- [Adapters](adapters) — channel setup and configuration
+- [Task Scheduler](task-scheduler) — recurring work and wakeups
+- [Time Travel](/architecture/data-model#forking-history) — fork and snapshot semantics
+- [The Canonical Agent](canonical-agent) — how `./exo.sh` wires these together

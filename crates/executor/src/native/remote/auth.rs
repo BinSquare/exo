@@ -168,6 +168,10 @@ impl AuthServer {
                     || v.record().id.to_string() == config.oidc.client_secret.vault
             })
             .context("OIDC client-secret vault not found")?;
+        ensure!(
+            vault.record().name != "global",
+            "server authentication requires a separate vault; global is shared by all users"
+        );
         let secret = vault
             .list_secrets()
             .await?

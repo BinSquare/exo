@@ -1,9 +1,15 @@
 ---
+search: false
 title: A Sandboxed Conversation
 description: Give your agent a shell in an isolated sandbox.
 ---
 
 # A Sandboxed Conversation
+
+::: warning Archived documentation
+This page describes the earlier Exo self-agent or older APIs and may be out of date. See the [current docs](/).
+These pages use older CLI and configuration syntax. The current local state directory is `~/.exo`; managed agents use `thread fork --up-to` rather than the older clone, rewind, or migrate commands.
+:::
 
 The default REPL conversation is plain chat. To let the agent run shell
 commands, create an agent and a conversation explicitly — conversations can
@@ -14,10 +20,9 @@ own a sandbox.
 ```bash
 cat > sandbox-example.md <<'EOF'
 ---
-name: "Sandbox Example"
 harness: basic
 config:
-  model: gpt-5.5
+  model: gpt-6.1-sol
   credential: openai
 ---
 Help the user with their task.
@@ -73,4 +78,4 @@ exo thread sandbox run sandbox-example local-dev "ls /"
 ```
 
 Sandboxes can be snapshotted and rewound together with conversation history
-— see [Time Travel](../concepts/time-travel).
+— see [Time Travel](/architecture/data-model#forking-history).

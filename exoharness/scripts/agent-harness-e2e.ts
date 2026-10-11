@@ -111,7 +111,7 @@ const harnesses: HarnessDefinition[] = [
     key: "pi",
     envName: "OPENAI_API_KEY",
     secret: "openai",
-    model: "gpt-5.5",
+    model: "gpt-6.1-sol",
     module: "exoharness/examples/typescript/pi-harness.ts",
     image: "exo-pi-sandbox:latest",
     imageBuildArgs: ["exoharness/containers/pi-sandbox"],
@@ -240,8 +240,8 @@ function saveAgentSpec(
   const definition = {
     name: slug,
     harness: resolve(repoRoot, harness.module),
-    config: {
-      model: harness.model,
+    model: {
+      name: harness.model,
       credential: harness.secret,
       braintrust: tracing
         ? {

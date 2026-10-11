@@ -5,10 +5,6 @@ description: Building, testing, CI, and contribution conventions.
 
 # Development
 
-::: warning Under construction
-  This section is a work in progress and not yet complete.
-:::
-
 Building, testing, CI, and contribution conventions.
 
 ```bash

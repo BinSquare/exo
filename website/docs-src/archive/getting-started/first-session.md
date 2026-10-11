@@ -1,11 +1,17 @@
 ---
+search: false
 title: Your First Session
 description: Talk to your agent, give it a real task, and teach it who you are.
 ---
 
 # Your First Session
 
-After [setup](./installation) you have two ways to talk to your agent:
+::: warning Archived documentation
+This page describes the earlier Exo self-agent or older APIs and may be out of date. See the [current docs](/).
+These pages use older CLI and configuration syntax. The current local state directory is `~/.exo`; managed agents use `thread fork --up-to` rather than the older clone, rewind, or migrate commands.
+:::
+
+After [setup](installation) you have two ways to talk to your agent:
 the **local REPL** in your terminal, and **ExoChat** — the
 `https://exoharness.ai/chat?...` URL the setup printed, which works from any
 browser.
@@ -70,4 +76,4 @@ Where to go from here: there's little else you *need* to learn — talk to the
 agent and ask it to evolve in the direction you want. When you're curious
 how it all works, read [Concepts](../concepts/index); when you want to
 build your own agent instead of using the canonical one, start with
-[Custom Agent Quickstart](../tutorials/write-your-own-agent).
+[Custom Agent Quickstart](../../tutorials/write-your-own-agent).

@@ -15,45 +15,45 @@ use executor::{
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    #[command(flatten)]
-    pub(crate) execution: crate::ExecutionArgs,
-    /// Serve only this saved agent; omit to serve the local provider.
-    #[arg(long)]
-    pub agent: Option<String>,
     /// OIDC login configuration; required for a non-loopback listener.
-    #[arg(long)]
+    #[arg(long, requires = "serve")]
     auth_file: Option<PathBuf>,
     /// Share agents and threads among admitted users; keep vaults private.
-    #[arg(long, requires = "auth_file")]
+    #[arg(long, requires_all = ["auth_file", "serve"])]
     multiplayer: bool,
     /// Address for the HTTP server.
-    #[arg(long, default_value = "127.0.0.1:4766")]
+    #[arg(long, default_value = "127.0.0.1:4766", requires = "serve")]
     bind: SocketAddr,
     /// DNS suffix for browser previews; resolve it to this host or an SSH tunnel.
-    #[arg(long, default_value = "localhost")]
+    #[arg(long, default_value = "localhost", requires = "serve")]
     preview_domain: String,
     /// Deployment configuration for adapters named in agent specs.
-    #[arg(long)]
+    #[arg(long, requires = "serve")]
     adapters_file: Option<PathBuf>,
     /// Maximum number of adapter workers.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, requires = "serve")]
     adapter_limit: usize,
     /// Concurrent thread resumptions during recovery.
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value = "4", requires = "serve")]
     recovery_thread_concurrency: NonZeroUsize,
-    #[arg(long)]
+    #[arg(long, requires = "serve")]
     drain_marker: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, requires = "serve")]
     reboot_notice: Option<PathBuf>,
     /// Run adapter supervision without opening the HTTP service.
-    #[arg(long)]
+    #[arg(long, requires = "serve")]
     adapters_only: bool,
     #[cfg(feature = "firecracker")]
     #[command(flatten, next_help_heading = "Firecracker backend options")]
     pub(crate) firecracker: crate::FirecrackerArgs,
 }
 
-pub async fn run(runtime: Arc<Runtime>, root: &Path, args: ServeArgs) -> Result<()> {
+pub async fn run(
+    runtime: Arc<Runtime>,
+    root: &Path,
+    args: ServeArgs,
+    only_agent: Option<exoharness::AgentId>,
+) -> Result<()> {
     runtime.set_recovery_concurrency(args.recovery_thread_concurrency)?;
     anyhow::ensure!(
         args.adapters_only || args.bind.ip().is_loopback() || args.auth_file.is_some(),
@@ -88,14 +88,10 @@ pub async fn run(runtime: Arc<Runtime>, root: &Path, args: ServeArgs) -> Result<
         service = service.with_auth(auth.clone(), args.multiplayer);
     }
     let mut store = executor::AdapterStore::new(root.join("adapters"));
-    let only_agent = if let Some(reference) = args.agent {
-        let agent = crate::must_get_agent(&runtime, &reference).await?;
-        service = service.for_agent(agent.record().id);
-        store = store.for_agent(agent.record().id.to_string());
-        Some(agent.record().id)
-    } else {
-        None
-    };
+    if let Some(agent) = only_agent {
+        service = service.for_agent(agent);
+        store = store.for_agent(agent.to_string());
+    }
     let definitions = args
         .adapters_file
         .as_deref()
@@ -278,10 +274,14 @@ mod tests {
             )?,
             None,
         ));
-        let source = "---\nname: worker\nharness: basic\nconfig:\n  model: test\nadapters: [inbox]\n---\nHandle incoming messages.";
+        let source = "---\nharness: basic\nmodel:\n  name: test\nadapters: [inbox]\n---\nHandle incoming messages.";
         let definition = exo_managed_agents::AgentDefinition::parse(source.into())?;
-        let agent = runtime.create_managed_agent(&definition, "worker").await?;
-        let other = runtime.create_managed_agent(&definition, "other").await?;
+        let agent = runtime
+            .create_managed_agent(&definition, "worker", "worker")
+            .await?;
+        let other = runtime
+            .create_managed_agent(&definition, "other", "other")
+            .await?;
         let store = executor::AdapterStore::new(temp.path().join("adapters"))
             .for_agent(agent.record().id.to_string());
         let mut definitions = BTreeMap::new();

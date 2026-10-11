@@ -2563,7 +2563,7 @@ if os.environ['EXO_TEST_CODEX'] == 'true':
         std::fs::write(source_dir.join("source.txt"), "pristine")?;
         let store = ResourceStore::image_store(&config.state_root, 1)?;
         let resources = store.prepare(vec![ResourceDefinition {
-            name: "repository".into(), mount_path: "/home/exo/workspace/repository".into(),
+            name: "repository".into(), mount_path: Some("/home/exo/workspace/repository".into()),
             mode: crate::FileSystemMountMode::ReadWrite,
             source: ResourceSource::Directory { path: source_dir },
         }])?;

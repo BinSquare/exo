@@ -173,7 +173,7 @@ async fn resource_git_push_uses_proxy_credentials_and_honors_revocation() -> Res
     let resource = PreparedResource {
         definition: ResourceDefinition {
             name: "code".into(),
-            mount_path: workspace.to_string_lossy().into_owned(),
+            mount_path: Some(workspace.to_string_lossy().into_owned()),
             mode: crate::FileSystemMountMode::ReadWrite,
             source: ResourceSource::GitRepository {
                 path: None,
@@ -190,7 +190,7 @@ async fn resource_git_push_uses_proxy_credentials_and_honors_revocation() -> Res
     store.remember_external(agent_id, thread_id, Some(std::slice::from_ref(&resource)))?;
     let mounts = [crate::FileSystemMount {
         host_path: workspace.to_string_lossy().into_owned(),
-        mount_path: resource.definition.mount_path.clone(),
+        mount_path: resource.definition.mount_path().into_owned(),
         mode: crate::FileSystemMountMode::ReadWrite,
         internal: Some(true),
     }];

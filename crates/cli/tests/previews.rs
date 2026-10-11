@@ -16,15 +16,15 @@ async fn setup(provider: &str) -> Result<Fixture> {
     f.cli(&[
         "agent",
         "create",
-        "dev",
-        "--file",
         f.agent_file.to_str().context("agent file")?,
+        "--name",
+        "dev",
     ])
     .await?;
     let file = f.temp.path().join("environment.yaml");
     std::fs::write(
         &file,
-        "name: dev\nconfig:\n  provider: local_process\n  image: unused\n  tcp_ports: [5173, 8000]\n",
+        "name: dev\nprovider: local_process\nimage: unused\ntcp_ports: [5173, 8000]\n",
     )?;
     f.cli(&[
         "environment",
@@ -46,9 +46,7 @@ async fn open_session_on(f: &Fixture, thread: &str, provider: Option<&str>) -> R
         args.extend(["--provider", provider]);
     }
     args.extend([
-        "agent",
         "run",
-        "--agent",
         agent_id.as_str(),
         "--environment",
         "dev",
@@ -107,18 +105,10 @@ async fn server_and_inline_threads_share_a_root_without_sharing_ownership() -> R
         .await?;
 
     for args in [
-        vec![
-            "agent",
-            "run",
-            "--agent",
-            agent_id.as_str(),
-            "--thread",
-            served_id.as_str(),
-        ],
+        vec!["run", agent_id.as_str(), "--thread", served_id.as_str()],
         vec!["thread", "delete", agent_id.as_str(), served_id.as_str()],
         vec!["agent", "delete", agent_id.as_str()],
         vec![
-            "thread",
             "sandbox",
             "run",
             agent_id.as_str(),
@@ -171,9 +161,7 @@ async fn server_and_inline_threads_share_a_root_without_sharing_ownership() -> R
         .cli(&[
             "--provider",
             "local",
-            "agent",
             "run",
-            "--agent",
             agent_id.as_str(),
             "--thread",
             "inline",
@@ -185,7 +173,6 @@ async fn server_and_inline_threads_share_a_root_without_sharing_ownership() -> R
     f.cli(&[
         "--provider",
         "local",
-        "thread",
         "sandbox",
         "run",
         agent_id.as_str(),
@@ -234,9 +221,7 @@ async fn inline_previews_keep_their_port_and_live_only_in_their_cli_process() ->
     let f = setup("local").await?;
     let first = f
         .cli(&[
-            "agent",
             "run",
-            "--agent",
             "dev",
             "--environment",
             "dev",
@@ -295,8 +280,7 @@ async fn inline_previews_keep_their_port_and_live_only_in_their_cli_process() ->
     }
 
     let conflict = TcpListener::bind(("127.0.0.1", port)).await?;
-    f.cli(&["agent", "run", "--agent", "dev", "--thread", "project"])
-        .await?;
+    f.cli(&["run", "dev", "--thread", "project"]).await?;
     let replacement = f
         .runtime
         .get_conversation_config(thread.as_ref())
@@ -341,7 +325,7 @@ async fn inline_previews_keep_their_port_and_live_only_in_their_cli_process() ->
     let file = f.temp.path().join("environment.yaml");
     std::fs::write(
         &file,
-        "name: dev\nconfig:\n  provider: local_process\n  image: unused\n  tcp_ports: []\n",
+        "name: dev\nprovider: local_process\nimage: unused\ntcp_ports: []\n",
     )?;
     f.cli(&[
         "environment",
@@ -352,23 +336,14 @@ async fn inline_previews_keep_their_port_and_live_only_in_their_cli_process() ->
     ])
     .await?;
     let disabled = f
-        .cli(&[
-            "agent",
-            "run",
-            "--agent",
-            "dev",
-            "--environment",
-            "dev",
-            "--thread",
-            "project",
-        ])
+        .cli(&["run", "dev", "--environment", "dev", "--thread", "project"])
         .await?;
     assert!(!disabled.contains("sandbox:"));
     let output = f
         .output(&["thread", "ports", "dev", "project"], None, None)
         .await?;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("declare config.tcp_ports"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("declare tcp_ports"));
     let empty = open_session_on(&f, "project", None).await?;
     assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
     close_session(empty).await?;
@@ -416,9 +391,7 @@ async fn http_provider_owns_one_proxy_after_clients_exit_and_removes_deleted_thr
             .is_none()
     );
     f.cli(&[
-        "agent",
         "run",
-        "--agent",
         "dev",
         "--thread",
         "first",

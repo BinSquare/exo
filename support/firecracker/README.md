@@ -201,8 +201,8 @@ sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
 Run an agent with the Firecracker backend:
 
 ```bash
-sudo target/debug/exo agent run \
-  --agent-file exoharness/examples/managed-agents/exo-developer.md \
+sudo target/debug/exo run \
+  exoharness/examples/managed-agents/exo-developer.md \
   --sandbox firecracker
 ```
 
@@ -210,10 +210,10 @@ The agent's thread owns its sandbox. In the conversation, `/sandbox COMMAND`
 runs a shell command in that sandbox. Use an environment definition to configure
 its image, working directory, resource limits, mounts, and networking.
 
-`exo serve --help` lists the `--firecracker-*` options for a persistent backend,
+`exo run --serve --help` lists the `--firecracker-*` options for a persistent backend,
 including VMM and jailer paths, kernel, initramfs, state root, VM sizing, DNS,
 UID range, image/workspace sizes, and network rate limits. The corresponding
-`EXO_FIRECRACKER_*` environment variables also work with `exo agent run`.
+`EXO_FIRECRACKER_*` environment variables also work with `exo run`.
 
 ## Resource storage
 
@@ -234,8 +234,8 @@ storage is used directly. Stop running sandboxes before the first migration.
 No storage environment variable or manual mount is needed:
 
 ```sh
-exo agent run \
-  --agent-file exoharness/examples/managed-agents/exo-developer.md \
+exo run \
+  exoharness/examples/managed-agents/exo-developer.md \
   --environment-file exoharness/examples/environments/codex-firecracker.yaml
 ```
 
