@@ -193,11 +193,8 @@ fn launcher_creates_and_updates_a_thread_environment_with_the_current_cli() -> R
     let canonical: exoharness::EnvironmentDefinition = serde_json::from_str(&fs::read_to_string(
         launch.join(".exo/launch-environment.json"),
     )?)?;
-    assert_eq!(
-        canonical.config.provider,
-        exoharness::SandboxProvider::Smolvm
-    );
-    assert_eq!(canonical.config.image, "ubuntu:24.04");
+    assert_eq!(canonical.provider, exoharness::SandboxProvider::Smolvm);
+    assert_eq!(canonical.image, "ubuntu:24.04");
 
     executable(
         &bin.join("docker"),
@@ -224,10 +221,7 @@ fn launcher_creates_and_updates_a_thread_environment_with_the_current_cli() -> R
     let overridden: exoharness::EnvironmentDefinition = serde_json::from_str(&fs::read_to_string(
         launch.join(".exo/launch-environment.json"),
     )?)?;
-    assert_eq!(
-        overridden.config.provider,
-        exoharness::SandboxProvider::Docker
-    );
+    assert_eq!(overridden.provider, exoharness::SandboxProvider::Docker);
 
     exo_managed_agents::AgentDefinition::parse(fs::read_to_string(
         launch.join(".exo/launch-agent.md"),
