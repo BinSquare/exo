@@ -91,7 +91,6 @@ enum ReplCommand {
         disable_help_flag = true
     )]
     Snapshot {
-        #[arg(value_parser = super::tui::parse_snapshot_kind)]
         kind: exoharness::SnapshotKind,
         sandbox_id: Option<String>,
     },

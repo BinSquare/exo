@@ -1263,6 +1263,7 @@ impl FirecrackerSandboxBackend {
                     machine_id.clone(),
                     false,
                     Some(capacity_reservation),
+                    false,
                 )
                 .await
             {
@@ -1314,7 +1315,7 @@ impl FirecrackerSandboxBackend {
             .lifecycle_locks
             .lock_sandbox(request.sandbox_id.as_str())
             .await;
-        self.acquire_resolved_locked(request, spec_hash, machine_id, one_shot, None)
+        self.acquire_resolved_locked(request, spec_hash, machine_id, one_shot, None, false)
             .await
     }
 
@@ -1328,6 +1329,7 @@ impl FirecrackerSandboxBackend {
         target_machine_id: String,
         one_shot: bool,
         capacity_reservation: Option<MachineCapacityReservation>,
+        pre_staged: bool,
     ) -> Result<FirecrackerSandboxHandle> {
         let stable_machine_id = machine_id(request.sandbox_id.as_str(), &spec_hash);
         let machine_key_prefix = format!("fc-{}-", stable_id(request.sandbox_id.as_str()));
@@ -1371,7 +1373,7 @@ impl FirecrackerSandboxBackend {
         };
         let machine = self
             .shared
-            .ensure_machine(&request, &target_machine_id, &spec_hash)
+            .ensure_machine(&request, &target_machine_id, &spec_hash, pre_staged)
             .await?;
         if !one_shot {
             self.shared.touch_machine_lease(&target_machine_id).await?;
@@ -2047,6 +2049,7 @@ impl Shared {
         request: &FirecrackerRequest,
         machine_id: &str,
         spec_hash: &str,
+        pre_staged: bool,
     ) -> Result<Machine> {
         let runtime = self
             .host_fingerprint
@@ -2100,7 +2103,7 @@ impl Shared {
                     .await?
             }
         };
-        let readiness = match self.prepare_and_launch(request, &record).await {
+        let readiness = match self.prepare_and_launch(request, &record, pre_staged).await {
             Ok(readiness) => readiness,
             Err(error) => {
                 if let Err(cleanup_error) = self
@@ -2289,6 +2292,7 @@ impl Shared {
         &self,
         request: &FirecrackerRequest,
         record: &MachineRecord,
+        pre_staged: bool,
     ) -> Result<GuestReadiness> {
         let config = self.config.clone();
         let request = request.clone();
@@ -2307,7 +2311,7 @@ impl Shared {
                         jailer_uid(&config, &record)?,
                     )?;
                 }
-                prepare_and_launch_blocking(&config, &request, &record)
+                prepare_and_launch_blocking(&config, &request, &record, pre_staged)
             })();
             if result.is_err() && record.network_enabled {
                 cleanup_network_blocking(&network);
@@ -3942,6 +3946,7 @@ fn prepare_and_launch_blocking(
     config: &FirecrackerConfig,
     request: &FirecrackerRequest,
     record: &MachineRecord,
+    pre_staged: bool,
 ) -> Result<GuestReadiness> {
     if let Some(template) = record.snapshot_template.as_ref()
         && prepare_snapshot_overlay(config, record, &template.key)?
@@ -4012,7 +4017,8 @@ fn prepare_and_launch_blocking(
             .state_root
             .join("workspaces")
             .join(format!("{workspace_id}.ext4"));
-        if !workspace.try_exists()? {
+        let jailed_workspace = root.join("workspace.ext4");
+        if !pre_staged && !workspace.try_exists()? {
             let file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -4027,21 +4033,11 @@ fn prepare_and_launch_blocking(
             run_checked("mkfs.ext4", &["-q", "-F", &workspace.to_string_lossy()])?;
             fs::set_permissions(&workspace, Permissions::from_mode(0o600))?;
         }
-        let jailed_workspace = root.join("workspace.ext4");
-        if jailed_workspace.try_exists()? {
-            fs::remove_file(&jailed_workspace)?;
-        }
-        fs::hard_link(&workspace, &jailed_workspace).with_context(|| {
-            format!(
-                "linking Firecracker workspace {} into {}",
-                workspace.display(),
-                jailed_workspace.display()
-            )
-        })?;
+        link_durable_disk(&workspace, &jailed_workspace, pre_staged)?;
         chown(&jailed_workspace, Some(host_uid), Some(host_uid))?;
     }
 
-    prepare_resource_drives(config, request, record, &root)?;
+    prepare_resource_drives(config, request, record, &root, pre_staged)?;
     let vm_config = firecracker_vm_configuration(config, request, record)?;
     let vm_config_path = root.join("vm-config.json");
     fs::write(&vm_config_path, serde_json::to_vec(&vm_config)?)?;
@@ -4055,31 +4051,41 @@ fn prepare_and_launch_blocking(
     Ok(GuestReadiness::Signal(ready_listener))
 }
 
+fn link_durable_disk(source: &Path, target: &Path, pre_staged: bool) -> Result<()> {
+    if pre_staged {
+        ensure!(
+            target.is_file(),
+            "missing staged disk: {}",
+            target.display()
+        );
+        return Ok(());
+    }
+    replace_hard_link(source, target)
+}
+
 fn prepare_resource_drives(
     config: &FirecrackerConfig,
     request: &FirecrackerRequest,
     record: &MachineRecord,
     root: &Path,
+    pre_staged: bool,
 ) -> Result<()> {
     let host_uid = jailer_uid(config, record)?;
     for (index, mount) in request.spec.mounts.iter().enumerate() {
         let source = resource_disk(config, request.scope, &mount.host_path)?;
-        let lock = File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(source.with_extension("lock"))?;
-        lock.lock()?;
         let target = root.join(format!("resource-{index}.ext4"));
-        if !target.try_exists()? {
+        if !pre_staged {
+            let _lock = capture_store::exclusive_lock(&source.with_extension("lock"))?;
+            if target.try_exists()? {
+                fs::remove_file(&target)?;
+            }
             ensure!(
                 fs::metadata(&source)?.nlink() == 1,
                 "resource disk is already attached to another sandbox"
             );
-            fs::hard_link(&source, &target).context(
-                "linking resource disk into Firecracker jail; state and resources must share XFS",
-            )?;
+            link_durable_disk(&source, &target, false)?;
+        } else {
+            link_durable_disk(&source, &target, true)?;
         }
         chown(&target, Some(host_uid), Some(host_uid))?;
         fs::set_permissions(&target, Permissions::from_mode(0o600))?;
@@ -4759,7 +4765,7 @@ fn remove_directory_if_present(path: &Path) -> Result<()> {
 }
 
 fn snapshot_budget_lock(config: &FirecrackerConfig) -> Result<SnapshotLease> {
-    capture_store::budget_lock(&config.state_root.join("snapshot-budget.lock"))
+    capture_store::exclusive_lock(&config.state_root.join("snapshot-budget.lock"))
 }
 
 fn retained_snapshot_bytes(config: &FirecrackerConfig) -> Result<u64> {
@@ -4809,7 +4815,8 @@ fn with_paused_snapshot_source<T>(
     let pid = root.join("firecracker.pid");
     let running = process_running(&pid);
     if running {
-        firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Paused" })?;
+        firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Paused" })
+            .context("pausing Firecracker snapshot source")?;
     }
     let result = capture().and_then(|value| {
         if running && suspend {
@@ -4980,6 +4987,7 @@ fn capture_snapshot_template(
                 },
                 FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT,
             )
+            .context("creating Firecracker snapshot")
         })?;
         let memory = fs::metadata(output.join("memory"))?;
         tracing::info!(
@@ -5078,7 +5086,7 @@ fn launch_snapshot_clone(
     template_key: &str,
 ) -> Result<GuestReadiness> {
     let root = prepare_snapshot_jail_files(config, request, record)?;
-    prepare_resource_drives(config, request, record, &root)?;
+    prepare_resource_drives(config, request, record, &root, false)?;
     let host_uid = jailer_uid(config, record)?;
     prepare_api_run_dir(&root, host_uid)?;
     let snapshot = root.join("snapshot");

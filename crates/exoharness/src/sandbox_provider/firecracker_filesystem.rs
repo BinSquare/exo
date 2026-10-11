@@ -91,7 +91,6 @@ impl FilesystemLayout {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct FilesystemManifest {
     template: bool,
-    version: u32,
     key: String,
     sandbox_id: SandboxId,
     base_image_sha256: String,
@@ -109,10 +108,6 @@ impl FilesystemManifest {
     }
 
     fn validate(self) -> Result<Self> {
-        ensure!(
-            self.version == 1,
-            "unsupported Firecracker filesystem snapshot version"
-        );
         validate_snapshot_key(&self.key)?;
         validate_snapshot_key(&self.base_image_sha256)?;
         ensure!(
@@ -231,14 +226,10 @@ fn capture_disks(
     mut manifest: FilesystemManifest,
     suspend: bool,
 ) -> Result<SnapshotPayload> {
-    let (temporary, _staging_lease) = manifest.staging_directory(config)?;
+    let (temporary, staging_lease) = manifest.staging_directory(config)?;
     let root = jail_root(config, &source.machine_id);
     fs::hard_link(root.join("rootfs.ext4"), temporary.path().join("base.ext4"))?;
-    {
-        let _budget = snapshot_budget_lock(config)?;
-        enforce_snapshot_budget(config)?;
-    }
-    with_paused_snapshot_source(&root, &source.machine_id, suspend, || {
+    let captured = with_paused_snapshot_source(&root, &source.machine_id, suspend, || {
         for name in manifest.layout.disk_names() {
             copy_sparse_reflink(&root.join(&name), &temporary.path().join(&name))
                 .with_context(|| format!("capturing required filesystem disk {name}"))?;
@@ -250,7 +241,15 @@ fn capture_disks(
             publish_capture(config, temporary.path(), &manifest)?;
         }
         Ok(())
-    })?;
+    });
+    if let Err(error) = captured {
+        drop(staging_lease);
+        let directory = manifest.directory(config);
+        if let Err(cleanup) = capture_store::delete(&directory) {
+            return Err(error.context(format!("deleting failed filesystem capture: {cleanup:#}")));
+        }
+        return Err(error);
+    }
     if !suspend {
         publish_capture(config, temporary.path(), &manifest)?;
     }
@@ -287,14 +286,14 @@ impl FirecrackerSandboxBackend {
                 disks.len() == manifest.disk_sizes.len(),
                 "filesystem import disk set is incomplete"
             );
-            ensure!(
-                super::super::firecracker_image::sha256_hex_of_file(&base_image)?
-                    == manifest.base_image_sha256,
-                "filesystem import base image does not match"
-            );
             manifest.key = new_capture_key();
             let (temporary, _staging_lease) = manifest.staging_directory(&config)?;
-            copy_sparse_reflink(&base_image, &temporary.path().join("base.ext4"))?;
+            prepare_imported_base(
+                &config,
+                &base_image,
+                &manifest.base_image_sha256,
+                &temporary.path().join("base.ext4"),
+            )?;
             for ((name, source), size) in manifest
                 .layout
                 .disk_names()
@@ -377,13 +376,19 @@ impl FirecrackerSandboxBackend {
                 || (!template && FilesystemLayout::from_spec(&request.spec) == manifest.layout),
             "filesystem restore mount layout does not match"
         );
-        let capture = self.filesystem_snapshot_files(payload).await?;
+        let capture = Arc::new(self.filesystem_snapshot_files(payload).await?);
         let mut resolved = prepare_request(request)?;
         validate_resource_shape(resolved.spec.resources.unwrap_or_default())?;
-        resolved.sandbox.spec.image = capture
-            .base_image
+        let config = self.shared.config.clone();
+        let capture_for_image = Arc::clone(&capture);
+        let digest = manifest.base_image_sha256.clone();
+        let image = tokio::task::spawn_blocking(move || {
+            cache_base_image(&config, &capture_for_image.base_image, &digest)
+        })
+        .await??;
+        resolved.sandbox.spec.image = image
             .to_str()
-            .context("capture base path is not UTF-8")?
+            .context("cached base path is not UTF-8")?
             .to_owned();
         let spec_hash = sandbox_spec_hash(&resolved.spec);
         let id = machine_id(&resolved.sandbox_id, &spec_hash);
@@ -395,7 +400,6 @@ impl FirecrackerSandboxBackend {
         );
         let config = self.shared.config.clone();
         let request_for_validation = resolved.clone();
-        let shared = Arc::clone(&self.shared);
         tokio::task::spawn_blocking(move || {
             let prefix = format!("fc-{}-", stable_id(&request_for_validation.sandbox_id));
             for entry in fs::read_dir(config.state_root.join("manifests"))? {
@@ -404,11 +408,6 @@ impl FirecrackerSandboxBackend {
                     "filesystem restore target already has an allocation"
                 );
             }
-            ensure!(
-                shared.base_image_digest(Path::new(&request_for_validation.spec.image))?
-                    == manifest.base_image_sha256,
-                "filesystem restore base image does not match"
-            );
             Ok::<_, anyhow::Error>(())
         })
         .await??;
@@ -419,13 +418,27 @@ impl FirecrackerSandboxBackend {
             .await?;
         let config = self.shared.config.clone();
         let request_for_disks = resolved.clone();
+        let capture_for_disks = Arc::clone(&capture);
         let result = async {
-            tokio::task::spawn_blocking(move || {
-                install_disks(&config, &record, &request_for_disks, &capture, template)
+            let disks = tokio::task::spawn_blocking(move || {
+                install_disks(
+                    &config,
+                    &record,
+                    &request_for_disks,
+                    &capture_for_disks,
+                    template,
+                )
             })
             .await??;
             let mut handle = self
-                .acquire_resolved_locked(resolved, spec_hash, id.clone(), false, Some(reservation))
+                .acquire_resolved_locked(
+                    resolved,
+                    spec_hash,
+                    id.clone(),
+                    false,
+                    Some(reservation),
+                    !template,
+                )
                 .await?;
             if let Some(egress) = egress {
                 drop(lifecycle_guard.take());
@@ -435,6 +448,7 @@ impl FirecrackerSandboxBackend {
                     .await?;
                 handle.egress = Some(egress);
             }
+            tokio::task::spawn_blocking(move || disks.commit()).await??;
             Ok(handle)
         }
         .await;
@@ -536,7 +550,6 @@ pub(super) async fn snapshot_filesystem(
         let payload = tokio::task::spawn_blocking(move || {
             let manifest = FilesystemManifest {
                 template,
-                version: 1,
                 key: new_capture_key(),
                 sandbox_id: request.sandbox_id,
                 base_image_sha256: capture_shared.base_image_digest(
@@ -560,7 +573,9 @@ pub(super) async fn snapshot_filesystem(
                 .lock()
                 .await
                 .retain(|_, entry| entry.machine_id != source.machine_id);
-            shared.cleanup_machine(&source.machine_id, true).await?;
+            if let Err(error) = shared.cleanup_machine(&source.machine_id, true).await {
+                tracing::warn!(machine_id = %source.machine_id, %error, "cleanup after filesystem suspension failed");
+            }
         }
         Ok(payload)
     })
@@ -610,65 +625,198 @@ fn collect_captures(config: &FirecrackerConfig, keep: Vec<SnapshotPayload>) -> R
     Ok(removed)
 }
 
+fn base_image_cache_path(config: &FirecrackerConfig, digest: &str) -> PathBuf {
+    config
+        .state_root
+        .join("images/filesystem")
+        .join(format!("{digest}.ext4"))
+}
+
+fn prepare_imported_base(
+    config: &FirecrackerConfig,
+    source: &Path,
+    digest: &str,
+    target: &Path,
+) -> Result<()> {
+    let cached = base_image_cache_path(config, digest);
+    if !cached.try_exists()? {
+        ensure!(
+            super::super::firecracker_image::sha256_hex_of_file(source)? == digest,
+            "filesystem import base image does not match"
+        );
+        copy_sparse_reflink(source, target)?;
+        fs::set_permissions(target, Permissions::from_mode(0o444))?;
+        cache_base_image(config, target, digest)?;
+        fs::remove_file(target)?;
+    }
+    fs::hard_link(cached, target)?;
+    Ok(())
+}
+
+fn cache_base_image(config: &FirecrackerConfig, source: &Path, digest: &str) -> Result<PathBuf> {
+    let cached = base_image_cache_path(config, digest);
+    let parent = cached.parent().context("missing image cache parent")?;
+    fs::create_dir_all(parent)?;
+    match fs::hard_link(source, &cached) {
+        Ok(()) => {
+            File::open(&cached)?.sync_all()?;
+            File::open(parent)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("pinning filesystem capture base image"),
+    }
+    Ok(cached.canonicalize()?)
+}
+
+struct InstalledDisks {
+    targets: Vec<(PathBuf, PathBuf)>,
+    _locks: Vec<SnapshotLease>,
+}
+
+impl InstalledDisks {
+    fn commit(self) -> Result<()> {
+        struct Replacement {
+            target: PathBuf,
+            next: tempfile::NamedTempFile,
+            previous: Option<tempfile::NamedTempFile>,
+        }
+        fn staged_link(source: &Path, target: &Path) -> Result<tempfile::NamedTempFile> {
+            let temporary = tempfile::NamedTempFile::new_in(
+                target.parent().context("restored disk has no parent")?,
+            )?;
+            fs::remove_file(temporary.path())?;
+            fs::hard_link(source, temporary.path())?;
+            Ok(temporary)
+        }
+        let mut replacements = Vec::new();
+        for (source, target) in &self.targets {
+            let previous = if target.try_exists()? {
+                Some(staged_link(target, target)?)
+            } else {
+                None
+            };
+            replacements.push(Replacement {
+                target: target.clone(),
+                next: staged_link(source, target)?,
+                previous,
+            });
+        }
+        let mut swapped = 0;
+        let result = (|| {
+            for replacement in &replacements {
+                fs::rename(replacement.next.path(), &replacement.target)?;
+                swapped += 1;
+                File::open(
+                    replacement
+                        .target
+                        .parent()
+                        .context("restored disk has no parent")?,
+                )?
+                .sync_all()?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })();
+        if result.is_err() {
+            for replacement in replacements.iter_mut().take(swapped).rev() {
+                let restored = match &replacement.previous {
+                    Some(previous) => fs::rename(previous.path(), &replacement.target),
+                    None => fs::remove_file(&replacement.target),
+                };
+                if let Err(error) = restored {
+                    if let Some(previous) = replacement.previous.take() {
+                        match previous.keep() {
+                            Ok((_, backup)) => {
+                                tracing::error!(path = %replacement.target.display(), backup = %backup.display(), %error, "failed to roll back restored disk")
+                            }
+                            Err(keep) => {
+                                tracing::error!(%keep, %error, "failed to preserve restored disk backup")
+                            }
+                        }
+                    } else {
+                        tracing::error!(path = %replacement.target.display(), %error, "failed to roll back restored disk");
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
 fn install_disks(
     config: &FirecrackerConfig,
     record: &MachineRecord,
     request: &FirecrackerRequest,
     capture: &FirecrackerFilesystemCapture,
     template: bool,
-) -> Result<()> {
+) -> Result<InstalledDisks> {
     let root = jail_root(config, &record.machine_id);
     fs::create_dir_all(&root)?;
-    let mut targets = vec![root.join("overlay.ext4")];
-    if let Some(workspace) = &record.workspace_id {
-        targets.push(
-            config
-                .state_root
-                .join("workspaces")
-                .join(format!("{workspace}.ext4")),
-        );
+    let mut targets = vec![(root.join("overlay.ext4"), None)];
+    if !template {
+        if let Some(workspace) = &record.workspace_id {
+            targets.push((
+                root.join("workspace.ext4"),
+                Some(
+                    config
+                        .state_root
+                        .join("workspaces")
+                        .join(format!("{workspace}.ext4")),
+                ),
+            ));
+        }
+        for (index, mount) in request.spec.mounts.iter().enumerate() {
+            targets.push((
+                root.join(format!("resource-{index}.ext4")),
+                Some(resource_disk(config, request.scope, &mount.host_path)?),
+            ));
+        }
     }
-    let mut resource_targets = Vec::new();
-    for mount in &request.spec.mounts {
-        let target = resource_disk(config, request.scope, &mount.host_path)?;
-        resource_targets.push(target.clone());
-        targets.push(target);
-    }
-    resource_targets.sort();
-    resource_targets.dedup();
+    let mut persistent = targets
+        .iter()
+        .filter_map(|(_, target)| target.clone())
+        .collect::<Vec<_>>();
+    persistent.sort();
+    persistent.dedup();
     let mut locks = Vec::new();
-    for target in resource_targets {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(target.with_extension("lock"))?;
-        locks.push(SnapshotLease::exclusive(lock)?);
-    }
-    for target in &targets {
+    for target in persistent {
+        locks.push(capture_store::exclusive_lock(
+            &target.with_extension("lock"),
+        )?);
         if target.try_exists()? {
             ensure!(
-                fs::symlink_metadata(target)?.is_file() && fs::metadata(target)?.nlink() == 1,
+                fs::symlink_metadata(&target)?.is_file() && fs::metadata(&target)?.nlink() == 1,
                 "filesystem restore disk is already attached: {}",
                 target.display()
             );
         }
     }
     ensure!(
-        capture.disks.len() == if template { 1 } else { targets.len() },
+        capture.disks.len() == targets.len(),
         "capture disk count differs from restore layout"
     );
-    for (source, target) in capture.disks.iter().zip(targets) {
-        let parent = target.parent().context("missing restored disk parent")?;
-        let temporary = tempfile::NamedTempFile::new_in(parent)?;
-        copy_sparse_reflink(source, temporary.path())?;
-        fs::set_permissions(temporary.path(), Permissions::from_mode(0o600))?;
-        temporary.as_file().sync_all()?;
-        temporary.persist(&target)?;
-        File::open(parent)?.sync_all()?;
+    let mut installed = InstalledDisks {
+        targets: Vec::new(),
+        _locks: locks,
+    };
+    let mut staged = HashMap::<PathBuf, PathBuf>::new();
+    for (source, (jailed, target)) in capture.disks.iter().zip(targets) {
+        if jailed.try_exists()? {
+            fs::remove_file(&jailed)?;
+        }
+        if let Some(existing) = target.as_ref().and_then(|target| staged.get(target)) {
+            fs::hard_link(existing, &jailed)?;
+            continue;
+        }
+        copy_sparse_reflink(source, &jailed)?;
+        fs::set_permissions(&jailed, Permissions::from_mode(0o600))?;
+        File::open(&jailed)?.sync_all()?;
+        if let Some(target) = target {
+            staged.insert(target.clone(), jailed.clone());
+            installed.targets.push((jailed, target));
+        }
     }
-    Ok(())
+    File::open(root)?.sync_all()?;
+    Ok(installed)
 }
 
 #[cfg(test)]

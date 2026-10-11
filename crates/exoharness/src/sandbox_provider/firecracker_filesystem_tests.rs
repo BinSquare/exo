@@ -3,7 +3,6 @@ use super::*;
 fn fixture(config: &FirecrackerConfig) -> Result<SnapshotPayload> {
     let manifest = FilesystemManifest {
         template: false,
-        version: 1,
         key: "a".repeat(64),
         sandbox_id: "filesystem-test".into(),
         base_image_sha256: "b".repeat(64),
@@ -50,6 +49,88 @@ fn required_disks_are_validated_and_upload_lease_prevents_deletion() -> Result<(
     assert!(open_capture(&config, payload.clone()).is_err());
     delete_capture(&config, payload.clone())?;
     delete_capture(&config, payload)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restored_base_stays_resolvable_after_capture_deletion_and_is_deduplicated() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = FirecrackerConfig {
+        state_root: temp.path().into(),
+        ..Default::default()
+    };
+    let payload = fixture(&config)?;
+    let capture = open_capture(&config, payload.clone())?;
+    fs::set_permissions(&capture.base_image, Permissions::from_mode(0o644))?;
+    let mut image = vec![0; 4096];
+    image[1080..1082].copy_from_slice(&[0x53, 0xef]);
+    fs::write(&capture.base_image, image)?;
+    fs::set_permissions(&capture.base_image, Permissions::from_mode(0o444))?;
+    let digest =
+        crate::sandbox_provider::firecracker_image::sha256_hex_of_file(&capture.base_image)?;
+    let cached = cache_base_image(&config, &capture.base_image, &digest)?;
+    let duplicate = temp.path().join("another-base.ext4");
+    fs::copy(&cached, &duplicate)?;
+    assert_eq!(cache_base_image(&config, &duplicate, &digest)?, cached);
+    assert_eq!(
+        fs::metadata(&cached)?.ino(),
+        fs::metadata(&capture.base_image)?.ino()
+    );
+    assert!(delete_capture(&config, payload.clone()).is_err());
+    drop(capture);
+    delete_capture(&config, payload)?;
+    assert_eq!(
+        crate::sandbox_provider::firecracker_image::resolve_image(
+            &config.state_root,
+            cached.to_str().context("image path is not UTF-8")?,
+            1,
+            &[],
+            &[],
+        )
+        .await?,
+        cached
+    );
+    Ok(())
+}
+
+#[test]
+fn imported_base_cache_hit_does_not_read_the_supplied_image() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let config = FirecrackerConfig {
+        state_root: root.path().into(),
+        ..Default::default()
+    };
+    let source = root.path().join("source.ext4");
+    fs::write(&source, b"immutable base")?;
+    fs::set_permissions(&source, Permissions::from_mode(0o444))?;
+    let digest = crate::sandbox_provider::firecracker_image::sha256_hex_of_file(&source)?;
+    let cached = cache_base_image(&config, &source, &digest)?;
+    fs::remove_file(&source)?;
+    let imported = root.path().join("imported.ext4");
+    prepare_imported_base(&config, &source, &digest, &imported)?;
+    assert_eq!(fs::metadata(&cached)?.ino(), fs::metadata(&imported)?.ino());
+    let error = prepare_imported_base(&config, &imported, &"0".repeat(64), &source).unwrap_err();
+    assert!(error.to_string().contains("base image does not match"));
+    assert!(!source.exists());
+    Ok(())
+}
+
+#[test]
+fn restored_disks_leave_previous_contents_until_commit() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let staged = temp.path().join("staged.ext4");
+    let target = temp.path().join("workspace.ext4");
+    fs::write(&staged, b"captured")?;
+    fs::write(&target, b"previous")?;
+    let install = || InstalledDisks {
+        targets: vec![(staged.clone(), target.clone())],
+        _locks: vec![],
+    };
+    drop(install());
+    assert_eq!(fs::read(&target)?, b"previous");
+    install().commit()?;
+    assert_eq!(fs::read(&target)?, b"captured");
+    assert_eq!(fs::metadata(&target)?.ino(), fs::metadata(&staged)?.ino());
     Ok(())
 }
 
@@ -208,6 +289,17 @@ async fn filesystem_snapshot_suspend_restart_and_import_round_trip() -> Result<(
         shell(&restored, "/tmp/retained-tool").await?,
         "root-installed:mutatedworkspace"
     );
+    request.spec.image = restored
+        .effective_image()
+        .context("restored image is missing")?;
+    request.provider_state = restored.provider_state();
+    backend.delete_snapshot(suspended.clone()).await?;
+    let reacquired = backend.acquire(request.clone()).await?;
+    assert_eq!(
+        shell(&reacquired, "/tmp/retained-tool").await?,
+        "root-installed:mutatedworkspace"
+    );
+    drop(reacquired);
     backend.terminate(request.clone()).await?;
     drop(restored);
     let restored = backend

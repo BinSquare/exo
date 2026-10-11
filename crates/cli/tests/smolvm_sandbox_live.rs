@@ -425,17 +425,8 @@ async fn settled_vm_count() -> usize {
     last
 }
 
-/// Snapshot round-trip through the backend API.
-///
-/// Gated on a REGISTRY image, unlike the other tests: `pack create --from-vm`
-/// re-pulls by manifest, and resolving that needs the sandbox to have network.
-///
-/// ```text
-/// docker run -d --rm -p 5055:5000 registry:2
-/// docker tag alpine:latest localhost:5055/alpine:latest && docker push localhost:5055/alpine:latest
-/// EXO_SMOLVM_REGISTRY_IMAGE=localhost:5055/alpine:latest cargo test -p exo \
-///   --test smolvm_sandbox_live snapshot -- --ignored --nocapture
-/// ```
+/// Snapshot, restore into fresh sandboxes, and repeatedly rewind a stopped source.
+/// Run with EXO_SMOLVM_TEST_IMAGE pointing at a local image archive or OCI image.
 #[tokio::test]
 #[ignore]
 async fn snapshot_round_trip_preserves_guest_state() {
@@ -446,14 +437,15 @@ async fn snapshot_round_trip_preserves_guest_state() {
     let backend = SmolvmSandboxBackend::with_mode(SmolvmExecutionMode::Warm);
     let ttl = Some(Duration::from_secs(600));
 
+    let source_request = request(
+        image.clone(),
+        &workspace,
+        SandboxNetworkPolicy::Unrestricted,
+        "snap-source",
+        ttl,
+    );
     let source = backend
-        .acquire(request(
-            image.clone(),
-            &workspace,
-            SandboxNetworkPolicy::Unrestricted,
-            "snap-source",
-            ttl,
-        ))
+        .acquire(source_request.clone())
         .await
         .expect("acquire source sandbox");
 
@@ -538,7 +530,32 @@ async fn snapshot_round_trip_preserves_guest_state() {
             .trim(),
         "repo-state"
     );
-    cleanup(&source).await;
+    let mut current = source.clone();
+    for _ in 0..2 {
+        assert!(
+            current
+                .exec(&command(&[
+                    "sh",
+                    "-c",
+                    "echo changed > /root/marker; echo changed > /workspace/marker",
+                ]))
+                .await
+                .unwrap()
+                .ok
+        );
+        current.stop().await.unwrap();
+        current = backend
+            .acquire_from_snapshot(source_request.clone(), payload.clone())
+            .await
+            .expect("restore over the stopped source sandbox");
+        let markers = current
+            .exec(&command(&["cat", "/root/marker", "/workspace/marker"]))
+            .await
+            .unwrap();
+        assert!(markers.ok, "read failed: {}", markers.stderr);
+        assert_eq!(markers.stdout, "packed-state\nrepo-state\n");
+    }
+    cleanup(&current).await;
     cleanup(&restored).await;
     cleanup(&second).await;
     backend.delete_snapshot(payload).await.unwrap();

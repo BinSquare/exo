@@ -60,7 +60,7 @@ function snapshotSandboxTool(): ToolInstance {
   return hostTool({
     name: "snapshot_sandbox",
     description:
-      "Capture the requested sandbox state so it can be rewound later. Filesystem snapshots restore files with a fresh process runtime; full snapshots also restore memory and execution. Unsupported kinds fail.",
+      "Capture the requested sandbox state so it can be rewound later. Filesystem snapshots restore files with a fresh process runtime; full snapshots also restore memory and execution. Use filesystem unless you need processes or memory preserved. Unsupported kinds fail.",
     parameters: {
       type: "object",
       additionalProperties: false,

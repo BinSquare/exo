@@ -10,7 +10,6 @@ const MAX_CAPTURE_MOUNTS: usize = 21;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Manifest {
-    version: u32,
     key: String,
     workdir: String,
     volumes: Vec<Volume>,
@@ -38,9 +37,7 @@ impl Manifest {
 
     fn validate(self) -> Result<Self> {
         ensure!(
-            self.version == 1
-                && self.key.len() == 32
-                && self.key.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            self.key.len() == 32 && self.key.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "invalid smolvm capture identity"
         );
         ensure!(
@@ -54,6 +51,16 @@ impl Manifest {
 pub(super) struct Lease {
     pub directory: PathBuf,
     _lease: SnapshotLease,
+}
+
+pub(super) async fn lock_machine(root: &Path, machine: &str) -> Result<SnapshotLease> {
+    let directory = root.with_extension("locks");
+    let slot = Sha256::digest(machine.as_bytes())[0];
+    tokio::task::spawn_blocking(move || {
+        fs::create_dir_all(&directory)?;
+        capture_store::exclusive_lock(&directory.join(format!("{slot:02x}.lock")))
+    })
+    .await?
 }
 
 pub(super) fn staging_directory(root: &Path) -> Result<(tempfile::TempDir, SnapshotLease)> {
@@ -84,34 +91,6 @@ pub(super) fn open(root: &Path, manifest: &Manifest) -> Result<Lease> {
     })
 }
 
-fn clone_directory(source: &Path, target: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-        let source = CString::new(source.as_os_str().as_bytes())?;
-        let target = CString::new(target.as_os_str().as_bytes())?;
-        ensure!(
-            unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } == 0,
-            "mounted directory copies require APFS: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let output = std::process::Command::new("cp")
-            .args(["-a", "--reflink=always", "--"])
-            .arg(source)
-            .arg(target)
-            .output()?;
-        ensure!(
-            output.status.success(),
-            "mounted directory copies require reflinks: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
-}
-
 fn volume_root(path: &Path) -> Option<&Path> {
     let root = path.parent()?.parent()?;
     (path.ends_with("mount/workspace") && root.join("volume.sparseimage").is_file()).then_some(root)
@@ -130,7 +109,6 @@ pub(super) fn publish(
     staging: tempfile::TempDir,
     request: &SandboxRequest,
 ) -> Result<SnapshotPayload> {
-    enforce_budget(root)?;
     let mut volumes = Vec::new();
     ensure!(
         request.spec.mounts.len() <= MAX_CAPTURE_MOUNTS,
@@ -146,7 +124,7 @@ pub(super) fn publish(
             crate::local_volume::mount_volume(source)?;
             cloned?;
         } else {
-            clone_directory(&mount.host_path, &target)?;
+            crate::local_volume::clone_path(&mount.host_path, &target)?;
         }
         volumes.push(Volume {
             guest_path: mount.guest_path.clone(),
@@ -155,7 +133,6 @@ pub(super) fn publish(
         });
     }
     let manifest = Manifest {
-        version: 1,
         key: uuid::Uuid::new_v4().simple().to_string(),
         workdir: request.spec.default_workdir.clone(),
         volumes,
@@ -163,9 +140,7 @@ pub(super) fn publish(
     let mut file = File::create(staging.path().join("manifest.json"))?;
     serde_json::to_writer(&mut file, &manifest)?;
     drop(file);
-    for entry in fs::read_dir(staging.path())? {
-        capture_store::sync_tree(&entry?.path())?;
-    }
+    capture_store::sync_tree(staging.path())?;
     capture_store::publish(
         staging.path(),
         &root.join(&manifest.key),
@@ -178,39 +153,68 @@ pub(super) fn publish(
     })
 }
 
+struct RestoredMount {
+    target: PathBuf,
+    backup: tempfile::TempDir,
+    access: SandboxMountAccess,
+    apfs: bool,
+}
+
 pub(super) struct RestoredMounts {
-    directories: Vec<(PathBuf, bool)>,
+    mounts: Vec<RestoredMount>,
+    committed: bool,
 }
 
 impl RestoredMounts {
     pub(super) fn keep(mut self) {
-        self.directories.clear();
+        self.committed = true;
     }
 }
 
 impl Drop for RestoredMounts {
     fn drop(&mut self) {
-        for (directory, apfs) in self.directories.iter().rev() {
+        if self.committed {
+            return;
+        }
+        for mount in self.mounts.drain(..).rev() {
             let cleanup = (|| {
-                if *apfs {
-                    crate::local_volume::unmount_volume(directory)?;
-                    let image = directory.join("volume.sparseimage");
+                if mount.apfs {
+                    crate::local_volume::unmount_volume(&mount.target)?;
+                    let image = mount.target.join("volume.sparseimage");
                     if image.try_exists()? {
-                        fs::remove_file(image)?;
+                        fs::remove_file(&image)?;
                     }
-                    let mount = directory.join("mount");
-                    if mount.try_exists()? {
-                        fs::remove_dir(mount)?;
+                    let previous = mount.backup.path().join("volume.sparseimage");
+                    if previous.try_exists()? {
+                        fs::rename(previous, &image)?;
+                        mount_volume_with_access(&mount.target, mount.access)?;
+                    } else if mount.target.join("mount").try_exists()? {
+                        fs::remove_dir_all(mount.target.join("mount"))?;
                     }
-                } else if directory.try_exists()? {
-                    fs::remove_dir_all(directory)?;
+                } else {
+                    if mount.target.try_exists()? {
+                        fs::remove_dir_all(&mount.target)?;
+                    }
+                    let previous = mount.backup.path().join("previous");
+                    if previous.try_exists()? {
+                        fs::rename(previous, &mount.target)?;
+                    }
                 }
                 Ok::<_, anyhow::Error>(())
             })();
             if let Err(error) = cleanup {
-                tracing::warn!(path = %directory.display(), %error, "failed to remove restored mount");
+                let backup = mount.backup.keep();
+                tracing::warn!(path = %mount.target.display(), backup = %backup.display(), %error, "failed to roll back restored mount");
             }
         }
+    }
+}
+
+fn mount_volume_with_access(target: &Path, access: SandboxMountAccess) -> Result<PathBuf> {
+    if access == SandboxMountAccess::ReadOnly {
+        crate::local_volume::mount_read_only(target)
+    } else {
+        crate::local_volume::mount_volume(target)
     }
 }
 
@@ -225,7 +229,8 @@ pub(super) fn restore_mounts(
         "filesystem capture layout changed"
     );
     let mut restored = RestoredMounts {
-        directories: Vec::new(),
+        mounts: Vec::new(),
+        committed: false,
     };
     for (index, (volume, mount)) in manifest
         .volumes
@@ -238,28 +243,49 @@ pub(super) fn restore_mounts(
             "mounted volume layout changed"
         );
         let source = directory.join(format!("volume-{index}"));
-        fs::create_dir_all(&mount.host_path)?;
         let target = if volume.apfs {
+            volume_root(&mount.host_path)
+                .unwrap_or(&mount.host_path)
+                .to_owned()
+        } else {
             mount.host_path.clone()
-        } else {
-            mount.host_path.join("captured")
         };
-        let owned_path = if volume.apfs {
-            target.join("volume.sparseimage")
+        let parent = target.parent().context("restored mount has no parent")?;
+        fs::create_dir_all(parent)?;
+        let backup = tempfile::Builder::new()
+            .prefix(".restore-")
+            .tempdir_in(parent)?;
+        if volume.apfs {
+            fs::create_dir_all(&target)?;
+            crate::local_volume::unmount_volume(&target)?;
+            let image = target.join("volume.sparseimage");
+            if image.try_exists()?
+                && let Err(error) = fs::rename(&image, backup.path().join("volume.sparseimage"))
+            {
+                return match mount_volume_with_access(&target, mount.access) {
+                    Ok(_) => Err(error).context("staging previous resource volume"),
+                    Err(cleanup) => Err(anyhow::Error::new(error)
+                        .context(format!("remounting previous resource volume: {cleanup:#}"))),
+                };
+            }
         } else {
-            target.clone()
-        };
-        ensure!(
-            !owned_path.try_exists()?,
-            "restored mount target already exists"
-        );
-        restored.directories.push((target.clone(), volume.apfs));
+            crate::local_volume::clone_path(&source, &backup.path().join("new"))?;
+            if target.try_exists()? {
+                fs::rename(&target, backup.path().join("previous"))?;
+            }
+        }
+        let staged = backup.path().join("new");
+        restored.mounts.push(RestoredMount {
+            target: target.clone(),
+            backup,
+            access: mount.access,
+            apfs: volume.apfs,
+        });
         if volume.apfs {
             crate::local_volume::clone_volume(&source, &target)?;
-            mount.host_path = crate::local_volume::mount_volume(&target)?;
+            mount.host_path = mount_volume_with_access(&target, mount.access)?;
         } else {
-            clone_directory(&source, &target)?;
-            mount.host_path = target;
+            fs::rename(staged, &target)?;
         }
     }
     Ok(restored)
@@ -277,7 +303,7 @@ pub(super) fn collect(root: &Path, keep: &[SnapshotPayload]) -> Result<usize> {
     if !root.try_exists()? {
         return Ok(0);
     }
-    let _budget = capture_store::budget_lock(&root.join("budget.lock"))?;
+    let _budget = capture_store::exclusive_lock(&root.join("budget.lock"))?;
     capture_store::collect(root, &keep, |directory| {
         let manifest: Manifest = capture_store::read_manifest(directory)?;
         Ok(root.join(manifest.validate()?.key))
@@ -291,7 +317,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires APFS disk images"]
-    fn managed_apfs_volume_capture_remounts_source_and_restores_fresh_volume() -> Result<()> {
+    fn managed_apfs_volume_restores_repeatedly_and_rolls_back_existing_volume() -> Result<()> {
         let root = tempfile::tempdir()?;
         let source = root.path().join("source");
         fs::create_dir(&source)?;
@@ -316,17 +342,18 @@ mod tests {
         let manifest = Manifest::parse(&payload)?;
         let lease = open(root.path(), &manifest)?;
         let target = root.path().join("target");
-        request.spec.mounts[0].host_path = target.clone();
-        let result = restore_mounts(&lease.directory, &manifest, &mut request);
-        let captured = result.and_then(|mounts| {
-            let bytes = fs::read(request.spec.mounts[0].host_path.join("marker"))?;
+        fs::create_dir(&target)?;
+        crate::local_volume::create_sized_volume(&target, 1)?;
+        let target_workspace = crate::local_volume::mount_volume(&target)?;
+        request.spec.mounts[0].host_path = target_workspace.clone();
+        for _ in 0..2 {
+            fs::write(target_workspace.join("marker"), b"changed")?;
+            let mounts = restore_mounts(&lease.directory, &manifest, &mut request)?;
+            assert_eq!(request.spec.mounts[0].host_path, target_workspace);
+            assert_eq!(fs::read(target_workspace.join("marker"))?, b"captured");
             mounts.keep();
-            Ok(bytes)
-        });
-        let failed = root.path().join("failed");
-        fs::create_dir(&failed)?;
-        fs::write(failed.join("existing"), b"keep")?;
-        request.spec.mounts[0].host_path = failed.clone();
+        }
+        request.spec.mounts[0].host_path = workspace.clone();
         request.spec.mounts.push(crate::SandboxMount {
             host_path: root.path().join("missing"),
             guest_path: "/missing".into(),
@@ -338,12 +365,9 @@ mod tests {
         missing.guest_path = "/missing".into();
         partial.volumes.push(missing);
         assert!(restore_mounts(&lease.directory, &partial, &mut request).is_err());
-        assert!(!failed.join("volume.sparseimage").exists());
-        assert!(!failed.join("mount").exists());
-        assert_eq!(fs::read(failed.join("existing"))?, b"keep");
+        assert_eq!(fs::read(workspace.join("marker"))?, b"later");
         crate::local_volume::unmount_volume(&source)?;
         crate::local_volume::unmount_volume(&target)?;
-        assert_eq!(captured?, b"captured");
         drop(lease);
         delete(root.path(), &payload)?;
         Ok(())
@@ -388,6 +412,61 @@ mod tests {
         drop(lease);
         delete(root.path(), &payload)?;
         delete(root.path(), &payload)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn machine_lock_files_are_bounded_and_reused() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let captures = root.path().join("captures");
+        let mut slots = std::collections::HashSet::new();
+        for index in 0..512 {
+            let machine = format!("machine-{index}");
+            slots.insert(Sha256::digest(machine.as_bytes())[0]);
+            drop(lock_machine(&captures, &machine).await?);
+        }
+        let count = fs::read_dir(captures.with_extension("locks"))?.count();
+        assert_eq!(count, slots.len());
+        assert!(count <= 256);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_restore_rewinds_shared_paths_but_requires_peers_to_remount() -> Result<()> {
+        use std::io::Read;
+        let root = tempfile::tempdir()?;
+        let shared = root.path().join("shared");
+        fs::create_dir(&shared)?;
+        fs::write(shared.join("marker"), b"captured")?;
+        let mut request = super::super::tests::test_request(Some(Duration::from_secs(60)));
+        request.spec.mounts = vec![crate::SandboxMount {
+            host_path: shared.clone(),
+            guest_path: "/repo".into(),
+            access: SandboxMountAccess::ReadWrite,
+            internal: false,
+        }];
+        let peer = request.clone();
+        let (staging, staging_lease) = staging_directory(root.path())?;
+        fs::write(
+            staging.path().join("machine.smolmachine"),
+            b"unit-test pack",
+        )?;
+        let payload = publish(root.path(), staging, &request)?;
+        drop(staging_lease);
+        fs::write(shared.join("marker"), b"later")?;
+        let mut attached = File::open(peer.spec.mounts[0].host_path.join("marker"))?;
+        let manifest = Manifest::parse(&payload)?;
+        let lease = open(root.path(), &manifest)?;
+        restore_mounts(&lease.directory, &manifest, &mut request)?.keep();
+        assert_eq!(request.spec.mounts[0].host_path, shared);
+        assert_eq!(
+            fs::read(peer.spec.mounts[0].host_path.join("marker"))?,
+            b"captured"
+        );
+        let mut previous = Vec::new();
+        attached.read_to_end(&mut previous)?;
+        assert_eq!(previous, b"later");
         Ok(())
     }
 
@@ -475,7 +554,7 @@ mod tests {
             b"unit-test pack",
         )?;
         let directory = staging.path().to_owned();
-        let budget = capture_store::budget_lock(&captures.join("budget.lock"))?;
+        let budget = capture_store::exclusive_lock(&captures.join("budget.lock"))?;
         let root_for_publish = captures.clone();
         let publisher = std::thread::spawn(move || {
             let _lease = staging_lease;
@@ -520,7 +599,6 @@ mod tests {
             },
         ];
         let manifest = Manifest {
-            version: 1,
             key: "a".repeat(32),
             workdir: request.spec.default_workdir.clone(),
             volumes: vec![
@@ -537,7 +615,7 @@ mod tests {
             ],
         };
         assert!(restore_mounts(root.path(), &manifest, &mut request).is_err());
-        assert!(!first.join("captured").exists());
+        assert!(!first.join("marker").exists());
         assert_eq!(fs::read(first.join("existing"))?, b"keep");
         Ok(())
     }
@@ -618,10 +696,12 @@ esac"#
             );
             let message = format!("{error:#}");
             assert!(message.contains("injected failure"), "{message}");
-            if cleanup_fails {
-                assert!(message.contains("cleanup failure"), "{message}");
-            }
-            assert!(!target.join("captured").exists());
+            assert_eq!(
+                message.contains("cleanup failure"),
+                cleanup_fails && failure == "start",
+                "{message}"
+            );
+            assert!(!target.join("marker").exists());
             assert_eq!(fs::read(target.join("existing"))?, b"keep");
         }
         Ok(())

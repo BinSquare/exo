@@ -123,6 +123,46 @@ impl LimaFirecrackerSandboxBackend {
         )))
     }
 
+    async fn acquire_with_egress(
+        &self,
+        request: SandboxRequest,
+        snapshot: Option<SnapshotPayload>,
+        egress: Option<Arc<SandboxEgress>>,
+    ) -> Result<LimaFirecrackerSandboxHandle> {
+        let restoring = snapshot.is_some();
+        let mut handle = self
+            .acquire_request(
+                FirecrackerRequest {
+                    sandbox: request.clone(),
+                    egress_proxy: egress.as_ref().map(|egress| egress.endpoints()),
+                },
+                snapshot,
+            )
+            .await?;
+        if let Some(egress) = egress {
+            let initialized = async {
+                let source = handle
+                    .source_ipv4
+                    .context("Firecracker sandbox has no egress source")?;
+                egress.initialize(&handle, source).await
+            }
+            .await;
+            if let Err(error) = initialized {
+                if !restoring {
+                    return Err(error);
+                }
+                return match self.terminate_request(request).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "sandbox initialization cleanup failed: {cleanup:#}"
+                    ))),
+                };
+            }
+            handle.egress = Some(egress);
+        }
+        Ok(handle)
+    }
+
     async fn acquire_request(
         &self,
         request: FirecrackerRequest,
@@ -307,25 +347,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
                 request.clone(),
                 self.external_proxy.as_ref(),
                 |policy| async move { self.egress_transport(&policy).await },
-                |egress| async move {
-                    let mut handle = self
-                        .acquire_request(
-                            FirecrackerRequest {
-                                sandbox: request,
-                                egress_proxy: egress.as_ref().map(|egress| egress.endpoints()),
-                            },
-                            None,
-                        )
-                        .await?;
-                    if let Some(egress) = egress {
-                        let source = handle
-                            .source_ipv4
-                            .context("Firecracker sandbox has no egress source")?;
-                        egress.initialize(&handle, source).await?;
-                        handle.egress = Some(egress);
-                    }
-                    Ok(handle)
-                },
+                |egress| self.acquire_with_egress(request, None, egress),
                 terminate,
             )
             .await
@@ -447,36 +469,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
                 request.clone(),
                 self.external_proxy.as_ref(),
                 |policy| async move { self.egress_transport(&policy).await },
-                |egress| async move {
-                    let mut handle = self
-                        .acquire_request(
-                            FirecrackerRequest {
-                                sandbox: request.clone(),
-                                egress_proxy: egress.as_ref().map(|egress| egress.endpoints()),
-                            },
-                            Some(payload),
-                        )
-                        .await?;
-                    if let Some(egress) = egress {
-                        let initialized = async {
-                            let source = handle
-                                .source_ipv4
-                                .context("Firecracker sandbox has no egress source")?;
-                            egress.initialize(&handle, source).await
-                        }
-                        .await;
-                        if let Err(error) = initialized {
-                            return match self.terminate_request(request).await {
-                                Ok(()) => Err(error),
-                                Err(cleanup) => Err(error.context(format!(
-                                    "filesystem restore cleanup failed: {cleanup:#}"
-                                ))),
-                            };
-                        }
-                        handle.egress = Some(egress);
-                    }
-                    Ok(handle)
-                },
+                |egress| self.acquire_with_egress(request, Some(payload), egress),
                 terminate,
             )
             .await

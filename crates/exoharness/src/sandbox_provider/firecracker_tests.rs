@@ -22,6 +22,24 @@ fn test_runtime() -> FirecrackerRuntimeFingerprint {
 }
 
 #[test]
+fn ordinary_launch_relinks_durable_disks_after_an_uncommitted_restore() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let durable = root.path().join("durable.ext4");
+    let jailed = root.path().join("workspace.ext4");
+    fs::write(&durable, b"previous")?;
+    fs::write(&jailed, b"restored")?;
+    link_durable_disk(&durable, &jailed, true)?;
+    assert_eq!(fs::read(&jailed)?, b"restored");
+    assert_eq!(fs::read(&durable)?, b"previous");
+    link_durable_disk(&durable, &jailed, false)?;
+    assert_eq!(fs::read(&jailed)?, b"previous");
+    assert_eq!(fs::metadata(&durable)?.ino(), fs::metadata(&jailed)?.ino());
+    fs::remove_file(&jailed)?;
+    assert!(link_durable_disk(&durable, &jailed, true).is_err());
+    Ok(())
+}
+
+#[test]
 fn runtime_fingerprint_uses_requested_resources() {
     let resources = SandboxResourceShape::new(8, 16_384).unwrap();
     let runtime = test_host_runtime().for_resources(resources);

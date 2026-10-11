@@ -19,9 +19,9 @@ it, and the restore path that actually consumes it.
 ## What you get
 
 - `ConversationHandle::snapshot_sandbox(id, kind)` actually captures the live
-  container's filesystem and persists it.
+  sandbox state of the requested kind and persists it.
 - `ConversationHandle::start_sandbox(StartSandboxRequest { id, snapshot_id: Some(snapshot_id), .. })`
-  starts a fresh container whose filesystem is sourced from the snapshot,
+  starts a sandbox from the captured state,
   preserving the original sandbox's mounts, network policy, and lifecycle.
 - A chat-REPL slash-command surface — `/snapshot`, `/snapshots`, `/rewind <id>`,
   `/teleport <provider>` — that drives the round-trip without leaving the
@@ -36,7 +36,7 @@ it, and the restore path that actually consumes it.
 - Capture kind is explicit: `SnapshotKind::Filesystem` captures all writable
   filesystems and cold-boots on restore; `SnapshotKind::Full` additionally
   captures memory and execution state. External connections are not preserved.
-  Unsupported kinds or writable mounts fail instead of silently losing state.
+  Unsupported capture kinds or mount layouts fail instead of silently losing state.
 - **Not a conversation rewind.** The event log, message history, and prior
   tool calls are untouched. Use `conversation fork` to rewind the
   conversation itself.
@@ -49,16 +49,16 @@ it, and the restore path that actually consumes it.
 Snapshots are an interaction between three layers:
 
 ```
-ConversationHandle             ManagedSandboxHandle           ManagedSandboxBackend
-       │                              │                                │
-  snapshot_sandbox(id, kind) ──► running_sandboxes.get(id).snapshot(kind) ──┐    │
-       │                                                          │    │
-       ◄────────── SnapshotPayload { format, bytes } ──────────────┘    │
-       │                                                                │
-  put_bytes / put_json                                                  │
-  (manifest.json + payload.bin)                                         │
-                                                                        │
-  start_sandbox(req) ─── load manifest + payload ──► acquire_from_snapshot(req, payload)
+ConversationHandle                     ManagedSandboxHandle
+       │                                        │
+  snapshot_sandbox(id, kind) ────────► snapshot(kind)
+       ◄──── SnapshotPayload { format, bytes } ──┘
+       │
+  put_bytes / put_json
+  (manifest.json + payload.bin)
+       │                               ManagedSandboxBackend
+  start_sandbox(req)                             │
+       └── load manifest + payload ─► acquire_from_snapshot(req, payload)
 ```
 
 `ConversationHandle` orchestrates snapshot capture: it locates the live handle,
@@ -304,10 +304,12 @@ follow-up if larger images become routine.
 
 ### Snapshot lifecycle
 
-There is no GC. Inline payloads remain until their conversation directory
-is deleted. Firecracker captures live in the backend's snapshot namespace
-and require explicit deletion, independently of their source allocation.
-A future addition could prune unused snapshots or evict by total size.
+Inline payloads remain until their conversation directory is deleted.
+Firecracker and SmolVM retained captures live in the backend's snapshot namespace,
+independently of their source allocation. Call `delete_snapshot` to release a
+capture, or `collect_filesystem_snapshots` with the references that must be kept.
+The store skips captures with active leases and does not evict checkpoints
+automatically when its budget is exhausted.
 
 ### Restore semantics
 
@@ -322,8 +324,22 @@ Both `ManagedSandboxHandle::snapshot(kind)` and
 `SnapshotHandle::snapshot_sandbox(id, kind)` require a `SnapshotKind`.
 The HTTP request requires `snapshot_kind` (`filesystem` or `full`).
 Docker, Daytona, Sprites, and SmolVM support filesystem snapshots; E2B's
-current adapter supports full snapshots. Docker and SmolVM reject writable
-mounted volumes because their image/pack capture does not include them.
+current adapter supports full snapshots. Docker rejects writable mounted volumes.
+SmolVM captures writable directories and managed APFS resource volumes; Linux
+capture requires a filesystem with reflink support. Restore replaces each
+caller's host mount path with the captured contents. Callers must stop every
+sandbox sharing those paths before restoring, then restart them to remount the
+replacement directories or volumes. Existing mounts and open file descriptors
+can still refer to the previous contents.
+
+SmolVM's `SmolvmBackendConfig::snapshot_root` configures retained capture storage.
+The harness uses `cache/smolvm/filesystem-snapshots`; standalone backends default
+beside `image_cache`, or to `.exo/smolvm/filesystem-snapshots`. These paths resolve
+to absolute paths when the backend is constructed, and also identify its
+`exo.state-root` ownership namespace. A backend constructed from a different
+working directory must use the same explicit `snapshot_root` to restore those
+captures. Captures are kept outside the system temporary directory.
+
 The REPL requires `/snapshot <filesystem|full> [<sandbox-id>]`; the executor
 snapshot tool requires a `kind` argument. Teleport requests filesystem captures.
 
@@ -333,13 +349,13 @@ Firecracker supports both kinds. Filesystem capture requires version
 writable filesystem, pauses the VM, reflinks the root overlay, workspace,
 and resource disks, pins the immutable base image, and atomically publishes
 an immutable capture. Applications that need a transaction boundary across
-filesystems must quiesce their writes before capture. Capture resumes the source. `suspend(request,
-SnapshotKind::Filesystem)` publishes the same capture and kills the VM
+filesystems must quiesce their writes before capture. Capture resumes the source.
+`suspend(request, SnapshotKind::Filesystem)` publishes the same capture and kills the VM
 while it remains paused, then releases the execution allocation.
 Full suspension is currently unsupported.
 
-`acquire_from_snapshot` cold-boots filesystem captures, requiring the same
-base-image content and guest mount layout. Missing or truncated disks and
+`acquire_from_snapshot` cold-boots from the captured base image and writable
+disks, requiring the same guest mount layout. Missing or truncated disks and
 already allocated targets are rejected. A capture outlives the source
 allocation and is released explicitly with `delete_snapshot`.
 
@@ -349,11 +365,13 @@ and disk paths with a lease that prevents deletion during upload.
 worker's XFS, returning a new local reference. Disk paths are ordered as
 root overlay, optional workspace, then resource mounts in specification
 order. The caller must checksum downloaded files before importing them.
-The requested base image must still be resolvable on the destination.
+The imported base is pinned in the destination image cache. Restored sandboxes
+keep using this cache path after the capture is deleted.
 Exo does not upload to S3 or publish/fence the service's durable checkpoint.
 
-Filesystem captures have a separate 64 GiB budget based on allocated
-blocks, conservatively counting shared extents for each file. They are
+Filesystem and full captures share a 64 GiB budget based on allocated
+blocks. Shared extents are conservatively counted for each disk file; immutable
+bases already pinned in the image cache are excluded. They are
 retained until explicitly deleted; this budget does not evict checkpoints.
 
 The native round-trip test requires root, KVM, an immutable local image,

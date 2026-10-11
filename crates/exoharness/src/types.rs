@@ -75,6 +75,14 @@ pub enum SnapshotKind {
     Full,
 }
 
+impl std::str::FromStr for SnapshotKind {
+    type Err = serde::de::value::Error;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::deserialize(serde::de::value::StrDeserializer::new(value))
+    }
+}
+
 #[async_trait]
 pub trait SnapshotHandle: Send + Sync {
     async fn snapshot_sandbox(&self, id: SandboxId, kind: SnapshotKind) -> Result<SnapshotId>;

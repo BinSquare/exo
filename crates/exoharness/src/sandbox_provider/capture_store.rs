@@ -6,7 +6,7 @@ use std::fs::{self, File, TryLockError};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-pub(super) fn budget_lock(path: &Path) -> Result<SnapshotLease> {
+pub(super) fn exclusive_lock(path: &Path) -> Result<SnapshotLease> {
     let file = File::options()
         .read(true)
         .write(true)
@@ -22,7 +22,7 @@ pub(super) fn staging_directory(
     budget_file: &Path,
 ) -> Result<(tempfile::TempDir, SnapshotLease)> {
     fs::create_dir_all(parent)?;
-    let _budget = budget_lock(budget_file)?;
+    let _budget = exclusive_lock(budget_file)?;
     let directory = tempfile::Builder::new()
         .prefix(".capture-")
         .tempdir_in(parent)?;
@@ -132,29 +132,20 @@ pub(super) fn collect(
 }
 
 pub(super) fn allocated(root: &Path) -> Result<u64> {
-    walk_allocated(root, &mut HashSet::new(), &mut 0, false)
+    walk_allocated(root, &mut HashSet::new(), false)
 }
 
 #[cfg(feature = "firecracker")]
 pub(super) fn allocated_files(root: &Path, inodes: &mut HashSet<(u64, u64)>) -> Result<u64> {
-    walk_allocated(root, inodes, &mut 0, true)
+    walk_allocated(root, inodes, true)
 }
 
-fn walk_allocated(
-    root: &Path,
-    inodes: &mut HashSet<(u64, u64)>,
-    count: &mut usize,
-    files_only: bool,
-) -> Result<u64> {
+fn walk_allocated(root: &Path, inodes: &mut HashSet<(u64, u64)>, files_only: bool) -> Result<u64> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error.into()),
     };
-    if !files_only {
-        *count += 1;
-        ensure!(*count <= 262_144, "capture file count exceeds its limit");
-    }
     if files_only && !metadata.is_dir() && !metadata.is_file() {
         bail!("unexpected file in snapshot storage");
     }
@@ -180,7 +171,7 @@ fn walk_allocated(
                 Err(error) => return Err(error.into()),
             };
             bytes = bytes
-                .checked_add(walk_allocated(&entry.path(), inodes, count, files_only)?)
+                .checked_add(walk_allocated(&entry.path(), inodes, files_only)?)
                 .context("snapshot size overflow")?;
         }
     }
@@ -188,10 +179,20 @@ fn walk_allocated(
 }
 
 pub(super) fn sync_tree(root: &Path) -> Result<()> {
+    let mut count = 0;
+    for entry in fs::read_dir(root)? {
+        sync_node(&entry?.path(), &mut count)?;
+    }
+    Ok(())
+}
+
+fn sync_node(root: &Path, count: &mut usize) -> Result<()> {
+    *count += 1;
+    ensure!(*count <= 262_144, "capture file count exceeds its limit");
     let metadata = fs::symlink_metadata(root)?;
     if metadata.is_dir() {
         for entry in fs::read_dir(root)? {
-            sync_tree(&entry?.path())?;
+            sync_node(&entry?.path(), count)?;
         }
     }
     if !metadata.file_type().is_symlink() {
@@ -208,7 +209,7 @@ pub(super) fn publish(
 ) -> Result<()> {
     File::open(temporary)?.sync_all()?;
     {
-        let _budget = budget_lock(budget_file)?;
+        let _budget = exclusive_lock(budget_file)?;
         check_budget()?;
         fs::rename(temporary, destination)
             .with_context(|| format!("publishing capture {}", destination.display()))?;
@@ -293,7 +294,7 @@ mod tests {
                 let walked = if round % 2 == 0 {
                     allocated(root.path())
                 } else {
-                    walk_allocated(root.path(), &mut HashSet::new(), &mut 0, true)
+                    walk_allocated(root.path(), &mut HashSet::new(), true)
                 };
                 delete.join().expect("capture deletion panicked")?;
                 walked?;

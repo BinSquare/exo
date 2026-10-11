@@ -506,20 +506,14 @@ impl ChatRepl {
                         }
                         other if other == "/snapshot" || other.starts_with("/snapshot ") => {
                             let mut arguments = other.split_whitespace().skip(1);
-                            let kind = arguments.next().map(parse_snapshot_kind);
+                            let kind = arguments.next().map(str::parse::<exoharness::SnapshotKind>);
                             let id = arguments.next().map(str::to_owned);
-                            if arguments.next().is_some() {
-                                println!("usage: /snapshot <filesystem|full> [<sandbox-id>]");
-                            } else {
-                                match kind {
-                                    Some(Ok(kind)) => print_lines(
-                                        snapshot_lines(self.conversation.as_ref(), id, kind).await,
-                                    ),
-                                    Some(Err(error)) => println!("{error}"),
-                                    None => println!(
-                                        "usage: /snapshot <filesystem|full> [<sandbox-id>]"
-                                    ),
-                                }
+                            match (kind, arguments.next()) {
+                                (Some(Ok(kind)), None) => print_lines(
+                                    snapshot_lines(self.conversation.as_ref(), id, kind).await,
+                                ),
+                                (Some(Err(error)), None) => println!("{error}"),
+                                _ => println!("usage: /snapshot <filesystem|full> [<sandbox-id>]"),
                             }
                         }
                         "/snapshots" => {
@@ -604,10 +598,9 @@ impl ChatRepl {
                 anyhow::anyhow!("no sandbox has been created in this conversation yet")
             })?;
         println!("snapshotting sandbox {sandbox_id}...");
-        let kind = teleport_snapshot_kind(self.conversation.as_ref(), &sandbox_id).await?;
         let snapshot_id = self
             .conversation
-            .snapshot_sandbox(sandbox_id.clone(), kind)
+            .snapshot_sandbox(sandbox_id.clone(), exoharness::SnapshotKind::Filesystem)
             .await?;
         println!("snapshot {snapshot_id} captured; restoring on {provider}...");
         self.conversation
@@ -989,14 +982,6 @@ async fn cost_summary(conversation: &dyn ConversationHandle) -> Result<Vec<Strin
     Ok(tracker.cost_lines())
 }
 
-pub(crate) fn parse_snapshot_kind(value: &str) -> Result<exoharness::SnapshotKind, String> {
-    match value {
-        "filesystem" => Ok(exoharness::SnapshotKind::Filesystem),
-        "full" => Ok(exoharness::SnapshotKind::Full),
-        _ => Err("snapshot kind must be filesystem or full".into()),
-    }
-}
-
 pub(crate) async fn snapshot_lines(
     conversation: &dyn ConversationHandle,
     explicit_id: Option<SandboxId>,
@@ -1097,23 +1082,6 @@ pub(crate) async fn teleport_lines(
     }
 }
 
-async fn teleport_snapshot_kind(
-    conversation: &dyn ConversationHandle,
-    sandbox_id: &SandboxId,
-) -> Result<exoharness::SnapshotKind> {
-    let source = conversation
-        .list_sandboxes()
-        .await?
-        .into_iter()
-        .find(|sandbox| &sandbox.id == sandbox_id)
-        .ok_or_else(|| anyhow::anyhow!("sandbox {sandbox_id} not found"))?;
-    Ok(if source.provider == SandboxProvider::E2b {
-        exoharness::SnapshotKind::Full
-    } else {
-        exoharness::SnapshotKind::Filesystem
-    })
-}
-
 async fn teleport_sandbox(
     conversation: &dyn ConversationHandle,
     provider_str: &str,
@@ -1124,9 +1092,8 @@ async fn teleport_sandbox(
     let sandbox_id = latest_sandbox_id(conversation)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no sandbox has been created in this conversation yet"))?;
-    let kind = teleport_snapshot_kind(conversation, &sandbox_id).await?;
     let snapshot_id = conversation
-        .snapshot_sandbox(sandbox_id.clone(), kind)
+        .snapshot_sandbox(sandbox_id.clone(), exoharness::SnapshotKind::Filesystem)
         .await?;
     conversation
         .start_sandbox(StartSandboxRequest {

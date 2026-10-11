@@ -540,31 +540,38 @@ async fn handle_request(
                 bytes: payload.into(),
             };
             let filesystem = payload.format == SnapshotFormat::FirecrackerFilesystemRef;
-            let handle = if filesystem {
-                crate::with_process_management(Arc::new(
+            let handle: Arc<dyn ManagedSandboxHandle> = if filesystem {
+                Arc::new(
                     backend
                         .acquire_filesystem_request(request, payload, None)
                         .await?,
-                ))
+                )
             } else {
                 backend
                     .acquire_from_snapshot(request.sandbox, payload)
                     .await?
             };
-            if let Err(error) = backends
-                .track_egress(&backend, handle.as_ref(), endpoints)
-                .await
-            {
-                if filesystem {
-                    return match backend.terminate(cleanup_request).await {
-                        Ok(()) => Err(error),
-                        Err(cleanup) => Err(error
-                            .context(format!("filesystem restore cleanup failed: {cleanup:#}"))),
-                    };
-                }
-                return Err(error);
+            let connected = async {
+                backends
+                    .track_egress(&backend, handle.as_ref(), endpoints)
+                    .await?;
+                backend.egress_source(handle.as_ref()).await
             }
-            let source_ipv4 = backend.egress_source(handle.as_ref()).await?;
+            .await;
+            let source_ipv4 = match connected {
+                Ok(source) => source,
+                Err(error) => {
+                    if filesystem {
+                        return match backend.terminate(cleanup_request).await {
+                            Ok(()) => Err(error),
+                            Err(cleanup) => Err(error.context(format!(
+                                "filesystem restore cleanup failed: {cleanup:#}"
+                            ))),
+                        };
+                    }
+                    return Err(error);
+                }
+            };
             Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),

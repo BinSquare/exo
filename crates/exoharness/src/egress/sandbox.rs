@@ -386,7 +386,9 @@ impl<H: ManagedSandboxHandle + 'static, P: SandboxProxy> EgressRuntime<H, P> {
     ) -> Result<T> {
         let _guard = self.lock(id).await;
         let result = suspend.await?;
-        self.remove(id).await?;
+        if let Err(error) = self.remove(id).await {
+            tracing::warn!(sandbox_id = %id, %error, "egress cleanup after suspension failed");
+        }
         Ok(result)
     }
 
@@ -505,6 +507,7 @@ mod tests {
     struct Transport {
         closed: AtomicBool,
         shutdown_completed: AtomicBool,
+        fail_shutdown: AtomicBool,
     }
 
     #[async_trait]
@@ -526,6 +529,10 @@ mod tests {
             self.close();
             tokio::task::yield_now().await;
             self.shutdown_completed.store(true, Ordering::SeqCst);
+            anyhow::ensure!(
+                !self.fail_shutdown.load(Ordering::SeqCst),
+                "proxy shutdown failed"
+            );
             Ok(())
         }
         fn is_closed(&self) -> bool {
@@ -661,6 +668,7 @@ mod tests {
         assert!(failure.is_err());
         assert!(!transport.is_closed());
         assert_eq!(runtime.sandboxes().len(), 1);
+        transport.fail_shutdown.store(true, Ordering::SeqCst);
         assert_eq!(runtime.suspend("one", async { Ok(42) }).await?, 42);
         assert!(transport.shutdown_completed.load(Ordering::SeqCst));
         assert!(runtime.sandboxes().is_empty());
