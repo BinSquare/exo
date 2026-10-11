@@ -20,6 +20,7 @@ struct ResourceBackend {
     release: Semaphore,
     materialized: Mutex<HashSet<ConversationId>>,
     deleted_snapshots: Mutex<Vec<bytes::Bytes>>,
+    delete_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     fail_snapshot_deletion: std::sync::atomic::AtomicBool,
     capture_gate: Mutex<Option<Arc<CaptureGate>>>,
 }
@@ -56,6 +57,10 @@ impl ManagedSandboxBackend for ResourceBackend {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             bail!("capture is busy");
+        }
+        let barrier = self.delete_barrier.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
         }
         self.deleted_snapshots.lock().unwrap().push(payload.bytes);
         Ok(())
@@ -168,6 +173,7 @@ impl Fixture {
             release: Semaphore::new(0),
             materialized: Mutex::new(HashSet::new()),
             deleted_snapshots: Mutex::new(Vec::new()),
+            delete_barrier: Mutex::new(None),
             fail_snapshot_deletion: std::sync::atomic::AtomicBool::new(false),
             capture_gate: Mutex::new(None),
         });
@@ -523,13 +529,28 @@ async fn owner_deletion_releases_snapshots_and_preserves_references_on_failure()
     );
     assert!(storage.get_bytes(&snapshot_paths[0]).await.is_ok());
     assert!(storage.get_bytes(&snapshot_paths[2]).await.is_ok());
-    assert!(harness.delete_agent(&agent.record().id).await?);
+    seed_snapshot(
+        storage,
+        &harness.owner_dir(ResourceScope::Agent {
+            agent_id: agent.record().id,
+        }),
+        Some(b"extra"),
+    )
+    .await?;
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    *backend.delete_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
+    let (deleted, _) = timeout(DEADLINE, async {
+        tokio::join!(harness.delete_agent(&agent.record().id), barrier.wait())
+    })
+    .await?;
+    assert!(deleted?);
     let mut deleted = backend.deleted_snapshots.lock().unwrap().clone();
     deleted.sort();
     assert_eq!(
         deleted,
         vec![
             bytes::Bytes::from_static(b"agent"),
+            bytes::Bytes::from_static(b"extra"),
             bytes::Bytes::from_static(b"first"),
             bytes::Bytes::from_static(b"second")
         ]

@@ -1,4 +1,5 @@
 use super::*;
+use futures::{StreamExt, TryStreamExt};
 
 const MAX_CAPTURE_MOUNTS: usize = 20;
 
@@ -537,12 +538,16 @@ pub(super) async fn snapshot_filesystem(
                 Arc::clone(&shared),
                 machine_from_record(&shared.config, source.clone()).vsock_path,
             );
-            for path in layout.sync_paths() {
-                guest
-                    .sync_filesystem(path)
-                    .await
-                    .context("syncing filesystem capture source")?;
-            }
+            futures::stream::iter(
+                layout
+                    .sync_paths()
+                    .map(|path| guest.sync_filesystem(path))
+                    .collect::<Vec<_>>(),
+            )
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>()
+            .await
+            .context("syncing filesystem capture source")?;
         }
         let capture_shared = Arc::clone(&shared);
         let source_for_capture = source.clone();

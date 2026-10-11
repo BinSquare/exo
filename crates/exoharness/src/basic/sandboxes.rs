@@ -1486,37 +1486,44 @@ pub(super) async fn delete_owned_snapshots(
     harness: &BasicExoHarness,
     owner_dir: &Path,
 ) -> Result<()> {
-    for manifest in harness
+    let manifests = harness
         .inner
         .storage
         .list_json_matching_suffix::<StoredSnapshotManifest>(
             owner_dir.join("snapshots"),
             "manifest.json",
         )
-        .await?
-    {
-        let Some(provider) = snapshot_capture_provider(&manifest.format) else {
-            continue;
-        };
-        let directory = owner_dir
-            .join("snapshots")
-            .join(manifest.snapshot_id.to_string());
-        let Some(bytes) =
-            snapshot_payload_bytes_if_exists(&harness.inner.storage, &directory, manifest.payload)
-                .await?
-        else {
-            continue;
-        };
-        let payload = SnapshotPayload {
-            format: manifest.format,
-            bytes: Bytes::from(bytes),
-        };
-        let backend = harness
-            .inner
-            .sandbox_backend_for_provider(manifest.provider.unwrap_or(provider))
-            .await?;
-        backend.delete_snapshot(payload).await?;
-    }
+        .await?;
+    stream::iter(manifests)
+        .map(|manifest| async move {
+            let Some(provider) = snapshot_capture_provider(&manifest.format) else {
+                return Ok(());
+            };
+            let directory = owner_dir
+                .join("snapshots")
+                .join(manifest.snapshot_id.to_string());
+            let Some(bytes) = snapshot_payload_bytes_if_exists(
+                &harness.inner.storage,
+                &directory,
+                manifest.payload,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            let payload = SnapshotPayload {
+                format: manifest.format,
+                bytes: Bytes::from(bytes),
+            };
+            let backend = harness
+                .inner
+                .sandbox_backend_for_provider(manifest.provider.unwrap_or(provider))
+                .await?;
+            backend.delete_snapshot(payload).await
+        })
+        .buffer_unordered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
     Ok(())
 }
 
