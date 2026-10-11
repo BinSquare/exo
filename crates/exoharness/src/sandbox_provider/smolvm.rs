@@ -1769,6 +1769,9 @@ mod tests {
             shared_backend.connect_tcp(request.clone(), 20_000)
         )?;
         assert!(first.is_some() && second.is_some());
+        for _ in 0..2 {
+            listener.accept().await?;
+        }
         assert!(
             backend
                 .connect_tcp(request.clone(), 20_000)
@@ -1786,6 +1789,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(std::fs::read_to_string(&inspected)?, "status\nstatus\n");
+        listener.accept().await?;
         let replacement = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         std::fs::write(host_port, replacement.local_addr()?.port().to_string())?;
         drop(listener);
@@ -1796,7 +1800,7 @@ mod tests {
                     .await?
                     .is_some()
             );
-            replacement.accept().await?;
+            tokio::time::timeout(Duration::from_secs(5), replacement.accept()).await??;
         }
         assert_eq!(
             std::fs::read_to_string(inspected)?,

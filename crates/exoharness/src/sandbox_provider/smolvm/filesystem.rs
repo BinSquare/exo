@@ -484,6 +484,7 @@ esac"#
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     fn mount(path: &Path, guest: &str) -> crate::SandboxMount {
         crate::SandboxMount {
             host_path: path.to_owned(),

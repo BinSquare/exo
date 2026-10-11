@@ -91,7 +91,6 @@ pub(crate) fn mount_volume(directory: &Path) -> Result<PathBuf> {
     mount_with_access(directory, false)
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn mount_read_only(directory: &Path) -> Result<PathBuf> {
     mount_with_access(directory, true)
 }
