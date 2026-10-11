@@ -536,80 +536,8 @@ async fn local_and_http_providers_use_the_same_runtime_contract() -> Result<()> 
     let provider = HttpProvider::new(f.client.clone());
     let remote = Arc::new(Runtime::new(provider, None));
     for runtime in [&f.runtime, &remote] {
-        let agent = runtime
-            .get_agent(&f.agent_id.to_string())
-            .await?
-            .context("agent")?;
-        let thread = agent.new_thread(Default::default()).await?;
-        let request = SendRequest {
-            input: vec![crate::harness_helpers::user_message("hello")],
-            session_id: None,
-        };
-        let (turn, mut stream) = runtime
-            .start_turn(
-                agent.clone(),
-                thread.clone(),
-                request.clone(),
-                true,
-                None,
-                Default::default(),
-            )
+        crate::contract_tests::test_provider(runtime, f.agent_id, || f.release.add_permits(1))
             .await?;
-        f.release.add_permits(1);
-        let completed = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = stream.next().await {
-                if let crate::ExecutionStreamEvent::Completed(result) = event? {
-                    return Ok(result);
-                }
-            }
-            bail!("turn did not complete")
-        })
-        .await??;
-        assert_eq!(completed.turn_id, turn.id);
-        assert_eq!(completed.session_id, turn.session_id);
-        let history = thread.get_events(None).await?.events;
-        assert_eq!(
-            history
-                .iter()
-                .filter(|event| matches!(event.data, EventData::TurnStarted { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            history
-                .iter()
-                .filter(|event| matches!(event.data, EventData::TurnEnded))
-                .count(),
-            1
-        );
-        assert_eq!(
-            history.last().context("terminal event")?.id,
-            completed.latest_event_id
-        );
-
-        let (turn, mut stream) = runtime
-            .start_turn(
-                agent,
-                thread.clone(),
-                request,
-                true,
-                None,
-                Default::default(),
-            )
-            .await?;
-        runtime
-            .cancel_turn(HarnessTurnKey::new(f.agent_id, thread.record().id, turn.id))
-            .await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = stream.next().await {
-                if let Err(error) = event {
-                    assert!(error.to_string().contains("cancel"));
-                    return Ok(());
-                }
-            }
-            bail!("cancellation did not finish the turn")
-        })
-        .await??;
     }
     remote.shutdown().await?;
     f.stop().await
