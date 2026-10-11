@@ -250,6 +250,14 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
         bail!("Vercel sandbox backend does not support external attachments")
     }
 
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> Result<SnapshotPayload> {
+        bail!("Vercel sandbox backend does not support suspension")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,

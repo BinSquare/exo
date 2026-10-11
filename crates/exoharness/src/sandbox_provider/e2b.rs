@@ -281,6 +281,14 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         bail!("E2B sandbox backend does not support external attachments")
     }
 
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> Result<SnapshotPayload> {
+        bail!("E2B sandbox backend does not support suspension")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,

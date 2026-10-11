@@ -2557,6 +2557,14 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         Ok(())
     }
 
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> crate::Result<SnapshotPayload> {
+        bail!("test provider-state backend does not support suspension")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,
@@ -2649,6 +2657,14 @@ impl ManagedSandboxBackend for TestSandboxBackend {
         _attachment: SandboxAttachment,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("test sandbox backend does not support attachment")
+    }
+
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> crate::Result<SnapshotPayload> {
+        bail!("test sandbox backend does not support suspension")
     }
 
     async fn acquire_from_snapshot(
@@ -2960,6 +2976,14 @@ impl ManagedSandboxBackend for RestoreImageTestBackend {
         _attachment: SandboxAttachment,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("restore-image test backend does not support attachment")
+    }
+
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> crate::Result<SnapshotPayload> {
+        bail!("restore-image test backend does not support suspension")
     }
 
     async fn acquire_from_snapshot(

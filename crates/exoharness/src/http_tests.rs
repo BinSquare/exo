@@ -542,6 +542,14 @@ impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
         bail!("snapshot test backend does not support attachment")
     }
 
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> crate::Result<SnapshotPayload> {
+        bail!("snapshot test backend does not support suspension")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,

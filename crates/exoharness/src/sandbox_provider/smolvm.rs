@@ -1090,6 +1090,14 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         bail!("smolvm sandboxes cannot be attached")
     }
 
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> Result<SnapshotPayload> {
+        bail!("smolvm sandbox backend does not support suspension")
+    }
+
     #[cfg(unix)]
     async fn acquire_from_snapshot(
         &self,

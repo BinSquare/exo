@@ -485,6 +485,14 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         )))
     }
 
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> Result<SnapshotPayload> {
+        bail!("container sandbox backend does not support suspension")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
@@ -815,6 +823,14 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
         _attachment: SandboxAttachment,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("local-process sandbox backend does not support attachments")
+    }
+
+    async fn suspend(
+        &self,
+        _request: SandboxRequest,
+        _kind: crate::SnapshotKind,
+    ) -> Result<SnapshotPayload> {
+        bail!("local-process sandbox backend does not support suspension")
     }
 
     async fn acquire_from_snapshot(

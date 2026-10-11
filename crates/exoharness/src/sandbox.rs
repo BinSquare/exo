@@ -482,11 +482,9 @@ pub trait ManagedSandboxBackend: Send + Sync {
     /// Used by the hosted sandbox service to checkpoint before releasing a VM.
     async fn suspend(
         &self,
-        _request: SandboxRequest,
-        _kind: crate::SnapshotKind,
-    ) -> Result<SnapshotPayload> {
-        bail!("sandbox backend does not support suspension")
-    }
+        request: SandboxRequest,
+        kind: crate::SnapshotKind,
+    ) -> Result<SnapshotPayload>;
 
     /// Permanently destroy the sandbox addressed by `request` and any retained
     /// backend state. Unlike stopping a handle, termination must be idempotent.
