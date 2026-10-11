@@ -1800,6 +1800,10 @@ mod tests {
         listener.accept().await?;
         let replacement = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         std::fs::write(host_port, replacement.local_addr()?.port().to_string())?;
+        backend.tcp_forwards.lock().unwrap().insert(
+            request.sandbox_id.clone(),
+            Arc::new(OnceCell::new_with(Some(BTreeMap::from([(20_000, 0)])))),
+        );
         drop(listener);
         for _ in 0..2 {
             assert!(
@@ -1808,7 +1812,9 @@ mod tests {
                     .await?
                     .is_some()
             );
-            tokio::time::timeout(Duration::from_secs(5), replacement.accept()).await??;
+            tokio::time::timeout(Duration::from_secs(5), replacement.accept())
+                .await
+                .context("accept refreshed smolvm TCP forward")??;
         }
         assert_eq!(
             std::fs::read_to_string(inspected)?,
