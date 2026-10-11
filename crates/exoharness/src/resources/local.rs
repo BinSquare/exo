@@ -21,6 +21,7 @@ pub struct ResourceStore {
     master_key: Option<PathBuf>,
     image_size_gib: Option<u64>,
     volume_size_gib: Option<u64>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -39,7 +40,21 @@ impl ResourceStore {
             master_key: None,
             image_size_gib: None,
             volume_size_gib: None,
+            cancel: None,
         })
+    }
+
+    pub(crate) fn with_cancellation(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn git<I, S>(&self, cwd: &Path, args: I, credential: Option<&GitCredential>) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        git_with_cancellation(cwd, args, credential, self.cancel.as_ref(), None)
     }
 
     pub fn with_volume_size(mut self, size_gib: u64) -> Result<Self> {
@@ -309,7 +324,20 @@ impl ResourceStore {
             .read(true)
             .write(true)
             .open(locks.join(name))?;
-        file.lock()?;
+        if let Some(cancel) = &self.cancel {
+            loop {
+                ensure!(!cancel.is_cancelled(), "resource preparation canceled");
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        } else {
+            file.lock()?;
+        }
         Ok(file)
     }
 
@@ -389,6 +417,10 @@ impl ResourceStore {
         else {
             bail!("local resource has no prepared snapshot");
         };
+        let parsed_url = url::Url::parse(url)?;
+        let repository = parsed_url[url::Position::BeforeHost..url::Position::AfterPath]
+            .trim_end_matches('/')
+            .trim_end_matches(".git");
         let key = digest(&serde_json::to_vec(&(
             url,
             checkout,
@@ -403,18 +435,19 @@ impl ResourceStore {
             self.create_volume(staging.path())?;
             fs::rename(staging.path(), &cache)?;
         }
-        tracing::info!(target: "exoharness::progress", "Mounting Git cache for {}", definition.name);
+        tracing::info!(target: "exoharness::progress", "Mounting Git cache for {}", repository);
         let workspace = self.mount_volume(&cache)?;
         let updated = (|| {
             if !workspace.join(".git").exists() {
-                git(&workspace, ["init"], None)?;
-                git(&workspace, ["remote", "add", "origin", url], None)?;
+                self.git(&workspace, ["init"], None)?;
+                self.git(&workspace, ["remote", "add", "origin", url], None)?;
             }
-            tracing::info!(target: "exoharness::progress", "Fetching Git resource {}", definition.name);
-            git(
+            tracing::info!(target: "exoharness::progress", "Fetching Git resource {}", repository);
+            git_with_cancellation(
                 &workspace,
                 [
                     "fetch",
+                    "--progress",
                     "--prune",
                     "--no-recurse-submodules",
                     "origin",
@@ -422,12 +455,14 @@ impl ResourceStore {
                     "+refs/tags/*:refs/tags/*",
                 ],
                 credential,
+                self.cancel.as_ref(),
+                Some(repository),
             )?;
             let branch = match checkout {
                 Some(GitCheckout::Branch { name }) => Some(name.clone()),
                 Some(GitCheckout::Commit { .. }) => None,
                 None => {
-                    let refs = git(
+                    let refs = self.git(
                         &workspace,
                         ["ls-remote", "--symref", "origin", "HEAD"],
                         credential,
@@ -448,25 +483,29 @@ impl ResourceStore {
                 (_, Some(GitCheckout::Commit { sha })) => sha.clone(),
                 _ => unreachable!(),
             };
-            let revision = git(
-                &workspace,
-                ["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
-                None,
-            )?
-            .trim()
-            .to_owned();
-            if let Some(name) = branch {
-                git(
+            let revision = self
+                .git(
                     &workspace,
-                    ["checkout", "--force", "-B", &name, &revision],
+                    ["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
                     None,
+                )?
+                .trim()
+                .to_owned();
+            tracing::info!(target: "exoharness::progress", "Checking out Git resource {}", repository);
+            if let Some(name) = branch {
+                git_with_cancellation(
+                    &workspace,
+                    ["checkout", "--progress", "--force", "-B", &name, &revision],
+                    None,
+                    self.cancel.as_ref(),
+                    Some(repository),
                 )?;
-                git(
+                self.git(
                     &workspace,
                     ["config", &format!("branch.{name}.remote"), "origin"],
                     None,
                 )?;
-                git(
+                self.git(
                     &workspace,
                     [
                         "config",
@@ -476,20 +515,24 @@ impl ResourceStore {
                     None,
                 )?;
             } else {
-                git(
+                git_with_cancellation(
                     &workspace,
-                    ["checkout", "--force", "--detach", &revision],
+                    ["checkout", "--progress", "--force", "--detach", &revision],
                     None,
+                    self.cancel.as_ref(),
+                    Some(repository),
                 )?;
             }
             Ok::<_, anyhow::Error>(revision)
         })();
         let updated = updated.and_then(|revision| {
+            tracing::info!(target: "exoharness::progress", "Preparing Git workspace for {}", repository);
             self.prepare_ownership(&workspace)?;
             Ok(revision)
         });
         self.unmount_volume(&cache)?;
         let revision = updated?;
+        tracing::info!(target: "exoharness::progress", "Cloning Git workspace for {}", repository);
         self.clone_volume(&cache, target)?;
         Ok((key, Some(revision)))
     }
@@ -691,10 +734,23 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    git_with_cancellation(cwd, args, credential, None, None)
+}
+
+fn git_with_cancellation<I, S>(
+    cwd: &Path,
+    args: I,
+    credential: Option<&GitCredential>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    progress: Option<&str>,
+) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let (mut command, header) = git_command(cwd, credential);
-    let output = command
-        .args(args)
-        .output()
+    command.args(args);
+    let output = command_output(command, cancel, progress)
         .context("running Git for resource preparation")?;
     if !output.status.success() {
         let mut message = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -719,6 +775,91 @@ where
         bail!("preparing Git resource: {}", message.trim());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn git_progress(line: &[u8]) -> Option<(&'static str, u8)> {
+    let line = std::str::from_utf8(line).ok()?.trim();
+    let line = line.strip_prefix("remote: ").unwrap_or(line);
+    let (phase, progress) = line.split_once(':')?;
+    let phase = match phase {
+        "Counting objects" => "Counting objects for",
+        "Compressing objects" => "Compressing objects for",
+        "Receiving objects" => "Downloading",
+        "Resolving deltas" => "Resolving deltas for",
+        "Updating files" => "Checking out",
+        _ => return None,
+    };
+    let percent = progress.split_once('%')?.0.trim().parse::<u8>().ok()?;
+    (percent <= 100).then_some((phase, percent))
+}
+
+fn command_output(
+    mut command: Command,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    progress: Option<&str>,
+) -> Result<Output> {
+    let Some(cancel) = cancel else {
+        return Ok(command.output()?);
+    };
+    ensure!(!cancel.is_cancelled(), "resource preparation canceled");
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    tokio::runtime::Handle::current().block_on(async {
+        let mut child = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()?;
+        #[cfg(unix)]
+        let process_group = child.id().context("resource command process ID")? as i32;
+        let mut stdout = child.stdout.take().context("resource command stdout")?;
+        let mut stderr = BufReader::new(child.stderr.take().context("resource command stderr")?);
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        tokio::select! {
+            result = async {
+                let (status, _, _) = tokio::try_join!(
+                    child.wait(),
+                    stdout.read_to_end(&mut output),
+                    async {
+                        let mut record = Vec::new();
+                        // Git rewrites progress lines with carriage returns.
+                        while stderr.read_until(b'\r', &mut record).await? > 0 {
+                            errors.extend_from_slice(&record);
+                            if let Some(resource) = progress {
+                                for line in record.split(|byte| *byte == b'\n' || *byte == b'\r') {
+                                    if let Some((phase, percent)) = git_progress(line) {
+                                        tracing::info!(target: "exoharness::progress", "{phase} {resource}: {percent}%");
+                                    }
+                                }
+                            }
+                            record.clear();
+                        }
+                        Ok::<_, std::io::Error>(())
+                    },
+                )?;
+                Ok(Output { status, stdout: output, stderr: errors })
+            } => result,
+            _ = cancel.cancelled() => {
+                #[cfg(unix)]
+                if unsafe { libc::kill(-process_group, libc::SIGKILL) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error.into());
+                    }
+                }
+                child.kill().await?;
+                bail!("resource preparation canceled");
+            }
+        }
+    })
 }
 
 fn checked(command: &mut Command) -> Result<Output> {

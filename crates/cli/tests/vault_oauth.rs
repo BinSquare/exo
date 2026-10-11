@@ -350,6 +350,32 @@ async fn vault_refresh_is_coordinated_across_reopened_stores_and_rejects_wrong_d
 }
 
 #[tokio::test]
+async fn oauth_discovery_accepts_401_without_authenticate_header() -> Result<()> {
+    let f = Fixture::new().await?;
+    Mock::given(path("/mcp/"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"errors": ["Unauthorized"]})))
+        .with_priority(1)
+        .mount(&f.server)
+        .await;
+    let base = f.server.uri();
+    Mock::given(path("/.well-known/oauth-protected-resource/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resource": format!("{base}/mcp/"),
+            "authorization_servers": [base],
+            "scopes_supported": ["workspace:read"]
+        })))
+        .mount(&f.server)
+        .await;
+    f.login(false, false).await?;
+    let id = f.secret_id().await?;
+    assert!(matches!(
+        f.vault.get_secret(&id).await?,
+        Some(Secret::Oauth { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_authorization_preserves_existing_vault_entry() -> Result<()> {
     let f = Fixture::new().await?;
     let id = f
@@ -529,7 +555,7 @@ async fn rejected_tokens_refresh_once_without_reinitializing_the_mcp_session() -
                     && String::from_utf8_lossy(&r.body).contains("\"initialize\"")
             })
             .count();
-        assert_eq!(initializations, 2);
+        assert_eq!(initializations, 1);
         assert!(
             matches!(f.vault.get_secret(&id).await?, Some(Secret::Oauth { refresh_token: Some(refresh), .. }) if refresh == "rotated-refresh")
         );

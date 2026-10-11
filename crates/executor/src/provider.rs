@@ -317,16 +317,15 @@ impl Harness<ProviderTurn> for LocalProvider {
                 .draining
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let mut preparations = std::mem::replace(
+        // Prefetch is optional work. Dropping its task group cancels callers;
+        // resource backends retain ownership while cleaning up interrupted I/O.
+        drop(std::mem::replace(
             &mut *self
                 .resource_preparations
                 .lock()
                 .expect("resource preparations poisoned"),
             TaskGroup::new(self.host.clone()),
-        );
-        while let Some(result) = preparations.join_next().await {
-            result?;
-        }
+        ));
         if self.state.caller().is_none() {
             self.turns.shutdown(self.harness.clone()).await
         } else {

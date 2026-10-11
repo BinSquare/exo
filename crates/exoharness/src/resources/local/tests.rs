@@ -669,3 +669,84 @@ fn sandbox_git_trust_is_limited_to_mounted_git_resources() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_resource_command_kills_children_after_parent_exits() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pid_file = temp.path().join("pid");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let task = {
+        let cancel = cancel.clone();
+        let pid_file = pid_file.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 3 & echo $! > \"$1\"", "sh"]);
+            command.arg(pid_file);
+            command_output(command, Some(&cancel), None)
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !pid_file.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let pid: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    // The shell exits, but its child keeps stdout open.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await??
+        .unwrap_err();
+    assert!(error.to_string().contains("resource preparation canceled"));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_resource_preparation_waiting_for_cache_lock() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = ResourceStore::new(temp.path())?;
+    let _lock = store.lock("cache")?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let task = tokio::task::spawn_blocking({
+        let store = store.with_cancellation(cancel.clone());
+        move || store.lock("cache")
+    });
+    cancel.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await??
+        .unwrap_err();
+    assert!(error.to_string().contains("resource preparation canceled"));
+    Ok(())
+}
+
+#[test]
+fn git_progress_recognizes_phases_without_displaying_errors() {
+    assert_eq!(
+        git_progress(b"remote: Counting objects:  12% (3/25)\r"),
+        Some(("Counting objects for", 12))
+    );
+    assert_eq!(
+        git_progress(b"Receiving objects:  42% (42/100), 1.2 MiB | 2 MiB/s\r"),
+        Some(("Downloading", 42))
+    );
+    assert_eq!(
+        git_progress(b"Resolving deltas: 100% (100/100), done.\n"),
+        Some(("Resolving deltas for", 100))
+    );
+    assert_eq!(
+        git_progress(b"Updating files:  50% (5/10)\r"),
+        Some(("Checking out", 50))
+    );
+    assert_eq!(git_progress(b"Receiving objects: 101% (101/100)"), None);
+    assert_eq!(git_progress(b"fatal: credential rejected (100%)"), None);
+}
