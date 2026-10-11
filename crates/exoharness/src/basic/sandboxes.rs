@@ -502,7 +502,9 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 } = &scope.event_sink
                 {
                     let current_head =
-                        latest_committed_event_id(&harness.inner.storage, &scope.owner_dir).await?;
+                        load_conversation_record(&harness.inner.storage, &scope.owner_dir)
+                            .await?
+                            .latest_event_id;
                     let stale = {
                         let state = state.lock().expect("turn state poisoned");
                         state.finished || state.latest_event_id != current_head
