@@ -61,7 +61,7 @@ async fn direct_connections_preserve_upgrade_bytes_and_report_unavailable_servic
     request.tcp_ports = vec![guest_port];
     let environment = exoharness::EnvironmentDefinition {
         name: "dev".into(),
-        config: request.clone(),
+        ..(request.clone()).into()
     };
     let thread = agent
         .new_thread(exoharness::NewThreadRequest {
@@ -156,7 +156,7 @@ async fn hostnames_are_stable_bounded_and_distinguish_equal_thread_names() -> Re
     config.tcp_ports = vec![5173, 8000];
     let mut env = exoharness::EnvironmentDefinition {
         name: "dev".into(),
-        config,
+        ..config.into()
     };
     let endpoint = PreviewEndpoint {
         domain: "localhost".into(),
@@ -174,7 +174,7 @@ async fn hostnames_are_stable_bounded_and_distinguish_equal_thread_names() -> Re
         let preview = previews_for(&record, &endpoint)?.unwrap();
         assert_eq!(preview.host.split('.').next().unwrap().len(), 8);
     }
-    env.config.tcp_ports.clear();
+    env.tcp_ports.clear();
     record.environment = Some(env);
     assert!(previews_for(&record, &endpoint)?.is_none());
     Ok(())
@@ -225,7 +225,7 @@ async fn server_restart_registers_saved_previews_without_opening_threads() -> Re
         .new_thread(exoharness::NewThreadRequest {
             environment: Some(exoharness::EnvironmentDefinition {
                 name: "web".into(),
-                config: request,
+                ..(request).into()
             }),
             ..Default::default()
         })

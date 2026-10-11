@@ -8,9 +8,9 @@ existing files, including across sandbox replacement.
 ```yaml
 resources:
   - name: code
-    type: git_repository
+    type: git
     url: https://github.com/exoharness/exo
-    checkout: { type: branch, name: main }
+    checkout: main
     mount_path: /workspace
   - name: fixtures
     type: directory
@@ -20,12 +20,13 @@ resources:
 ```
 
 ```sh
-exo agent create exo-dev --file agent.md
-exo agent run --agent exo-dev
-exo agent run --agent exo-dev --thread THREAD
+exo agent create agent.md --name exo-dev
+exo run exo-dev
+exo run exo-dev --thread THREAD
 ```
 
-Resource paths are absolute inside the sandbox. With resources, the default
+Git resources default to `/workspace/<resource name>` when `mount_path` is omitted;
+directory resources require an explicit mount path. Resource paths are absolute inside the sandbox. With resources, the default
 working directory is `/workspace`; an environment's `default_workdir` overrides
 it. Mount destinations must not overlap other resources or environment mounts.
 Resources always use a separate sandbox for each thread. Sandbox processes trust
@@ -36,7 +37,7 @@ does not trust unrelated repositories.
 ## Git cache
 
 For a Git URL, Exo maintains a checkout on a cached volume. For a new thread,
-preparation fetches the remote, advances the checkout to the requested branch or
+preparation fetches the remote, advances the checkout to the requested branch, tag, or
 commit, unmounts the volume, and makes a copy-on-write clone. The Git database and
 working tree are reused across updates. Refresh and clone are serialized for
 that cache; threads never mount the cache itself. Existing thread copies keep
@@ -44,7 +45,7 @@ their own files and Git state while later cache updates change only shared
 blocks that need writing.
 
 Omitting `checkout` follows the remote's default branch. Pin a commit with
-`checkout: {type: commit, sha: FULL_COMMIT_SHA}`. A failed fetch fails the command
+`checkout: FULL_COMMIT_SHA`. A failed fetch fails the command
 before execution instead of silently using an old checkout. Resuming an existing thread
 does not fetch and works when the source is offline.
 
@@ -59,7 +60,7 @@ select a vault containing that secret:
 ```sh
 exo vault secret create personal github --allow-origin https://github.com \
   --token-env GITHUB_TOKEN
-exo agent run --agent exo-dev --vault personal
+exo run exo-dev --vault personal
 ```
 
 The credential must target the Git server's HTTPS origin. If you created the
@@ -83,7 +84,7 @@ control repository access; this does not add a separate Git push approval policy
 ## Local sources
 
 `type: directory` copies a local directory, including untracked files. A local
-Git checkout can use `type: git_repository` with `path` instead of `url`; this
+Git checkout can use `type: git` with `path` instead of `url`; this
 also makes its Git metadata independent and preserves staged/unstaged changes.
 Local paths resolve relative to the agent file. The HTTP runtime accepts absolute
 paths on its own host; it does not upload the client's directory.
@@ -91,7 +92,7 @@ paths on its own host; it does not upload the client's directory.
 Local sources are prepared when creating or updating the agent. Preparation
 walks file metadata to reuse an unchanged snapshot. New threads clone that
 snapshot without scanning the original directory. To capture subsequent local
-edits, run `exo agent update exo-dev --file agent.md`. Existing threads keep their
+edits, run `exo agent update agent.md --name exo-dev`. Existing threads keep their
 previous workspace. Exo's runtime state is excluded; sources containing the vault
 master key are rejected. `--mount` remains a live host mount.
 

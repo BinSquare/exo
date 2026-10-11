@@ -237,7 +237,11 @@ impl VaultContext for BasicAgentHandle {
             )
             .await;
         }
-        let mut vaults = vec![self.harness.default_vault().await?];
+        let mut vaults = vec![global_vault(&self.harness).await?];
+        let personal = self.harness.default_vault().await?;
+        if personal.record().id != vaults[0].record().id {
+            vaults.push(personal);
+        }
         for id in &self.record.vaults {
             if let Some(vault) = self.harness.get_vault(id).await?
                 && !vaults.iter().any(|v| v.record().id == *id)

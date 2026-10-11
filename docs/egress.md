@@ -45,11 +45,11 @@ as `egress.json` (the flag also accepts `.yaml`, `.yml`, and `.toml`):
 ```bash
 exo vault secret create global notion \
   --allow-origin https://api.notion.com --token-env NOTION_API_KEY
-exo agent run --agent-file agent.md --egress-policy egress.json \
+exo run agent.md --egress-policy egress.json \
   --sandbox firecracker --sandbox-image /var/lib/exo/firecracker/rootfs.ext4
 ```
 
-An environment that sets `config.policy` cannot also be used with
+An environment that sets `networking` cannot also be used with
 `--egress-policy`. Put the credential bindings in the environment policy, or
 use sandbox options as above. Include the model API host in a limited network
 policy so the agent can call its model.
@@ -76,13 +76,13 @@ HTTP credentials authorize one exact HTTPS origin, including its port. The
 MCP credentials authorize only their exact MCP endpoint, including path and query.
 Keys without a destination do not grant HTTP access.
 Sandbox and credential host policies still apply. The same policy flag
-works with `exo agent run` and a managed Firecracker sandbox. Tell the agent which
+works with `exo run` and a managed Firecracker sandbox. Tell the agent which
 variables it can use; the runtime currently injects the environment without
 adding a credential inventory to its prompt.
 
-For a managed agent, use `exo agent run --agent-file agent.md --sandbox firecracker
+For a managed agent, use `exo run agent.md --sandbox firecracker
 --vault alice --egress-policy egress.json` to attach a named vault to the thread.
-`--agent-file` syncs a saved agent and starts a saved thread. Sandbox selection
+`exo run agent.md` syncs a saved agent and starts a saved thread. Sandbox selection
 and vault attachments belong to the thread; credential rotation reads the live
 vault.
 
@@ -92,8 +92,8 @@ The built-in Codex, Claude Code, and Pi wrappers select a vault secret from the
 agent spec and add it to the sandbox's ordinary credential policy:
 
 ```yaml
-config:
-  model: gpt-5-mini
+model:
+  name: gpt-5-mini
   credential: openai
 ```
 

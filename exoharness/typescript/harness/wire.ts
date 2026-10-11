@@ -9,6 +9,7 @@ import type {
 
 export interface RawAgentConfig {
   instructions: Message[];
+  frontend_tools?: AgentConfig["frontendTools"];
   harness: "basic" | "rlm" | "typescript" | "type_script" | "exo";
   typescript?: {
     module_path: string;
@@ -37,9 +38,7 @@ export interface RawConversationConfig {
     tool_policies: Record<string, PermissionPolicy>;
   };
   environment?: {
-    config: {
-      default_workdir?: string;
-    };
+    default_workdir?: string;
   };
   sandbox_image?: string | null;
   sandbox_provider?: AgentConfig["sandbox"]["provider"] | null;
@@ -61,6 +60,7 @@ export interface RawSendRequest {
 export function toAgentConfig(raw: RawAgentConfig): AgentConfig {
   return {
     instructions: raw.instructions,
+    frontendTools: raw.frontend_tools ?? [],
     harness: raw.harness === "type_script" ? "typescript" : raw.harness,
     typescript: raw.typescript
       ? {
@@ -92,7 +92,7 @@ export function toConversationConfig(
   return {
     permissionPolicy: raw.permissions.permission_policy,
     toolPolicies: raw.permissions.tool_policies,
-    workdir: raw.environment?.config.default_workdir,
+    workdir: raw.environment?.default_workdir,
     sandboxImage: raw.sandbox_image ?? null,
     sandboxProvider: raw.sandbox_provider ?? null,
     shellProgram: raw.shell_program ?? null,

@@ -185,7 +185,7 @@ Detached restart output is written to
 When `./exo.sh --control` is running, it also acts
 as the foreground REPL supervisor. Guardian builds write
 `.exo/exo-control.restart`; the control wrapper sees that marker, restarts only
-the child `exo agent run`, and keeps your terminal open.
+the child `exo run`, and keeps your terminal open.
 
 ## Setting up the identity
 

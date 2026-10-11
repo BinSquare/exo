@@ -17,7 +17,7 @@ def build_agent(logs_dir: Path = Path("/tmp/logs")) -> ExoAgent:
         exo_root="/runs/one/exo",
         exo_bin="/repo/target/debug/exo",
         exo_repo_root="/repo",
-        exo_model="gpt-5.5",
+        exo_model="gpt-6.1-sol",
     )
 
 
@@ -47,7 +47,7 @@ class PiHarnessTest(unittest.IsolatedAsyncioTestCase):
             exo_root="/runs/one/exo",
             exo_bin="/repo/target/debug/exo",
             exo_repo_root="/repo",
-            exo_model="gpt-5.5",
+            exo_model="gpt-6.1-sol",
             harness=harness,
         )
         agent.context_id = uuid4()

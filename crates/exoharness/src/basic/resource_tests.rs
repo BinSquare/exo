@@ -124,7 +124,7 @@ impl Fixture {
         vec![PreparedResource {
             definition: ResourceDefinition {
                 name: "workspace".into(),
-                mount_path: "/workspace".into(),
+                mount_path: Some("/workspace".into()),
                 mode: FileSystemMountMode::ReadWrite,
                 source: ResourceSource::Directory {
                     path: self.directory.path().to_owned(),
@@ -310,7 +310,7 @@ async fn environment_changes_and_forks_wait_for_resource_preparation() -> Result
         changing
             .update_environment(EnvironmentDefinition {
                 name: "local".into(),
-                config: CreateSandboxRequest {
+                ..(CreateSandboxRequest {
                     provider: SandboxProvider::LocalProcess,
                     image: "test".into(),
                     tcp_ports: vec![],
@@ -322,7 +322,8 @@ async fn environment_changes_and_forks_wait_for_resource_preparation() -> Result
                     policy: None,
                     enable_networking: Some(true),
                     idle_seconds: None,
-                },
+                })
+                .into()
             })
             .await
     });

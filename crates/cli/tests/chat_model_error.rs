@@ -1,6 +1,6 @@
 //! Regression test: a model-call failure mid-turn must not kill the chat.
 //!
-//! Exercises the real `exo agent run` binary with piped stdin against a
+//! Exercises the real `exo run` binary with piped stdin against a
 //! wiremock-backed fake OpenAI endpoint that always returns 400. Each sent
 //! line fails its turn; the chat must print `turn failed: ...` and keep
 //! reading input instead of exiting non-zero after the first error.
@@ -82,21 +82,21 @@ async fn chat_survives_model_call_failure() {
         &xdg,
     );
     let spec = root_dir.path().join("agent.md");
-    std::fs::write(&spec, format!("---\nname: Chat Error Test Agent\nharness: basic\nconfig:\n  model: gpt-test\n  credential: test-key\n  base_url: {}\n---\nReply to the user.\n", mock_server.uri())).unwrap();
+    std::fs::write(&spec, format!("---\nharness: basic\nmodel:\n  name: gpt-test\n  credential: test-key\n  base_url: {}\n---\nReply to the user.\n", mock_server.uri())).unwrap();
     run_exo(
         &[
             "agent",
             "create",
-            "test-agent",
-            "--file",
             spec.to_str().unwrap(),
+            "--name",
+            "test-agent",
         ],
         &root,
         &xdg,
     );
 
     let mut chat = Command::new(exo_bin())
-        .args(["agent", "run"])
+        .args(["run"])
         .args(["--root", &root])
         .args(["--secret-backend", "file"])
         .arg("--master-key-path")
@@ -105,7 +105,7 @@ async fn chat_survives_model_call_failure() {
             "EXO_LITELLM_PRICES_PATH",
             PathBuf::from(&root).join("prices.json"),
         )
-        .args(["--agent", "test-agent"])
+        .args(["test-agent"])
         .env("EXO_CONFIG_DIR", &xdg)
         .env("XDG_CONFIG_HOME", &xdg)
         .env("OPENAI_API_KEY", "sk-test-key")
@@ -113,7 +113,7 @@ async fn chat_survives_model_call_failure() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn exo agent run");
+        .expect("failed to spawn exo run");
 
     // Two turns: before the fix the process died on the first model error and
     // never saw the second line.

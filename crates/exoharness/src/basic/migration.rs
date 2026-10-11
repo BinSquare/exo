@@ -423,7 +423,7 @@ mod tests {
                             created_at: Utc::now(),
                             binding: LegacyBinding::Llm {
                                 name: "model".into(),
-                                model: "gpt-5.6-sol".into(),
+                                model: "gpt-6.1-sol".into(),
                                 base_url: None,
                                 secret_id: Some(secret_id),
                             },

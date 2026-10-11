@@ -1,7 +1,7 @@
 # Flags passed to eval.sh override this file.
 dataset = "terminal-bench"
 # For a shorter run of three easy tasks, use "terminal-bench-easy".
-model = "gpt-5.5"
+model = "gpt-6.1-sol"
 n_tasks = 10
 n_attempts = 1
 # Trials at once. Must be 1 for the exo harness, whose trials share one

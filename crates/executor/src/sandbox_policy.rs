@@ -10,17 +10,16 @@ pub async fn sandbox_policy(
     let mut configured = config
         .environment
         .as_ref()
-        .and_then(|env| env.config.policy.clone())
+        .and_then(|env| env.policy())
         .or_else(|| config.egress_policy.clone());
     let default_policy = if config
         .environment
         .as_ref()
         .and_then(|env| {
-            env.config
-                .policy
+            env.policy()
                 .as_ref()
                 .map(|policy| policy.networking_enabled())
-                .or(env.config.enable_networking)
+                .or(env.enable_networking)
         })
         .unwrap_or(agent_config.sandbox.enable_networking)
     {

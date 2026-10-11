@@ -15,7 +15,7 @@ async fn chat_shows_one_line_for_auth_errors_unless_full_verbosity_is_requested(
     std::fs::write(
         &agent,
         format!(
-            "---\nname: github-analyst\nharness: codex\nconfig:\n  model: gpt-5.6-sol\nmcp_servers:\n  - type: url\n    name: github\n    url: {}/mcp\n---\nInvestigate GitHub issues.\n",
+            "---\nharness: codex\nmodel:\n  name: gpt-6.1-sol\nmcp_servers:\n  - type: url\n    name: github\n    url: {}/mcp\n---\nInvestigate GitHub issues.\n",
             server.uri()
         ),
     )?;
@@ -26,12 +26,11 @@ async fn chat_shows_one_line_for_auth_errors_unless_full_verbosity_is_requested(
             .env_clear()
             .env("EXO_CONFIG_DIR", temp.path().join("config"))
             .current_dir(temp.path())
-            .args(["agent", "run"])
+            .args(["run"])
             .arg("--root")
             .arg(temp.path().join("state"))
             .args(["--secret-backend", "file", "--master-key-path"])
             .arg(temp.path().join("master-key"))
-            .arg("--agent-file")
             .arg(&agent);
         if let Some(verbosity) = verbosity {
             command.args(["--verbosity", verbosity]);

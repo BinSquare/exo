@@ -1,12 +1,10 @@
 name: pi-local
-config:
-  provider: apple_container
-  image: ghcr.io/exoharness/pi-devbox:latest
-  default_workdir: /home/exo/workspace
-  resources:
-    vcpu_count: 2
-    memory_mib: 2048
-  policy:
-    networking:
-      type: unrestricted
-  idle_seconds: 600
+provider: apple_container
+image: ghcr.io/exoharness/pi-devbox:latest
+default_workdir: /home/exo/workspace
+resources:
+  vcpu_count: 2
+  memory_mib: 2048
+networking:
+  type: unrestricted
+idle_seconds: 600

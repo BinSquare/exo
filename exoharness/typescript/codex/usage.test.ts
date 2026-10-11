@@ -9,12 +9,12 @@ import {
 describe("Codex usage events", () => {
   it("converts captured token counts into a usage event", () => {
     const usage = completion.params.usage;
-    expect(codexUsageEvent("gpt-5.6-sol", usage, null)).toEqual({
+    expect(codexUsageEvent("gpt-6.1-sol", usage, null)).toEqual({
       type: "messages",
       messages: [],
       response_id: undefined,
       usage: {
-        model: "gpt-5.6-sol",
+        model: "gpt-6.1-sol",
         prompt_tokens: 6800,
         completion_tokens: 62,
         prompt_cached_tokens: 0,

@@ -1,16 +1,22 @@
 ---
+search: false
 title: The Canonical Agent
-description: What setup.sh actually runs — the canonical exo agent, its tools, and its self-improvement loop.
+description: What setup.sh actually runs — the canonical Exo agent, its tools, and its self-improvement loop.
 ---
 
 # The Canonical Agent
 
-The [setup script](../getting-started/installation) launches exo's
+::: warning Archived documentation
+This page describes the earlier Exo self-agent or older APIs and may be out of date. See the [current docs](/).
+These pages use older CLI and configuration syntax. The current local state directory is `~/.exo`; managed agents use `thread fork --up-to` rather than the older clone, rewind, or migrate commands.
+:::
+
+The [setup script](../getting-started/installation) launches Exo's
 **canonical agent** — a long-running personal agent (its implementation
 lives at `exo/`) that demonstrates the full
 recursive-self-improvement loop. You can use it without knowing these
 internals, but a basic map helps when you want to guide its evolution.
-For how each piece starts, stays up, and stops, see [Lifecycles](./lifecycles).
+For how each piece starts, stays up, and stops, see [Lifecycles](lifecycles).
 
 ## The pieces
 
@@ -71,7 +77,7 @@ installs mid-turn are visible in the very next round.
 ## Why the layering matters here
 
 The canonical agent is the payoff of the
-[exoharness/executor split](./exoharness-and-executor): everything above
+[exoharness/executor split](/architecture/harnesses): everything above
 the substrate — prompts, tools, harness code, even the scheduler — is fair
 game for the agent to modify, because the event log, secrets, and snapshots
 below it guarantee a way back.

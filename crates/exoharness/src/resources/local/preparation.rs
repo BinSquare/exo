@@ -34,7 +34,7 @@ impl ResourceStore {
                 scope,
                 FileSystemMount {
                     host_path: host_path.to_string_lossy().into_owned(),
-                    mount_path: definition.mount_path.clone(),
+                    mount_path: definition.mount_path().into_owned(),
                     mode: crate::FileSystemMountMode::ReadWrite,
                     internal: Some(true),
                 },

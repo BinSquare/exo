@@ -336,12 +336,22 @@ async fn rmcp_login_private_vaults_and_session_revocation() -> Result<()> {
     assert!(bob_client.get_agent(local.record().id).await?.is_none());
     let alice_vaults = alice_client.list_vaults(ResourceScope::Global).await?;
     let bob_vaults = bob_client.list_vaults(ResourceScope::Global).await?;
-    assert_eq!(bob_vaults.len(), 1);
-    assert_eq!(bob_vaults[0].name, "personal");
+    assert_eq!(bob_vaults.len(), 2);
+    let global = bob_vaults.iter().find(|v| v.name == "global").unwrap();
+    let personal = bob_vaults.iter().find(|v| v.name == "personal").unwrap();
+    assert!(alice_vaults.iter().any(|v| v.id == global.id));
+    assert!(bob_client.delete_vault(global.id).await.is_err());
+    let mut config = f.auth.config.clone();
+    config.oidc.client_secret.vault = global.id.to_string();
+    let error = AuthServer::new(config, f.harness.clone())
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("global is shared by all users"));
     assert!(
         alice_vaults
             .iter()
-            .all(|v| v.id != f.auth.auth_vault() && v.id != bob_vaults[0].id)
+            .all(|v| v.id != f.auth.auth_vault() && v.id != personal.id)
     );
     let private = alice_client.create_vault("test").await?;
     let other = bob_client.create_vault("test").await?;
@@ -635,6 +645,12 @@ async fn multiplayer_shares_history_but_keeps_vaults_models_and_approvals_privat
     assert_eq!(bc.list_agents(None).await?.agents.len(), 1);
     let shared = b.get_agent(&agent.record().id).await?.unwrap();
     let bob_thread = shared.get_thread(&thread.record().id).await?.unwrap();
+    let global = b
+        .list_vaults()
+        .await?
+        .into_iter()
+        .find(|v| v.record().name == "global")
+        .unwrap();
     assert_eq!(
         bob_thread
             .list_vaults()
@@ -642,7 +658,7 @@ async fn multiplayer_shares_history_but_keeps_vaults_models_and_approvals_privat
             .iter()
             .map(|v| v.record().id)
             .collect::<Vec<_>>(),
-        vec![bv.record().id]
+        vec![global.record().id, bv.record().id]
     );
     assert!(
         bob_thread
@@ -1007,6 +1023,64 @@ async fn shared_vaults_require_attachment_and_keep_writes_with_the_owner() -> Re
         })
         .await?;
     let thread = agent.new_thread(Default::default()).await?;
+    let inherited = thread.list_vaults().await?;
+    assert_eq!(
+        inherited
+            .iter()
+            .map(|v| v.record().name.as_str())
+            .collect::<Vec<_>>(),
+        ["global", "personal"]
+    );
+    let global = inherited[0].record().id;
+    let personal = inherited[1].record().id;
+    let shared_key = PutSecretRequest {
+        name: "key".into(),
+        policy: Some(
+            exoharness::vault::CredentialDestination::origin("https://api.openai.com")?.into(),
+        ),
+        secret: Secret::Key {
+            value: "global-key".into(),
+        },
+    };
+    ac.put_secret(ResourceScope::Global, global, &shared_key)
+        .await?;
+    assert!(
+        bc.put_secret(ResourceScope::Global, global, &shared_key)
+            .await
+            .is_err()
+    );
+    let definition = exo_managed_agents::AgentDefinition::parse(
+        "---\nharness: basic\nmodel:\n  name: gpt-5-mini\n  credential: key\n---\nHelp.\n".into(),
+    )?;
+    let mut model = crate::managed_agents::agent_config(
+        &definition,
+        exoharness::SandboxProvider::LocalProcess,
+        None,
+        None,
+    )?;
+    assert_eq!(
+        crate::harness_helpers::resolve_model(thread.as_ref(), &model)
+            .await?
+            .api_key,
+        "global-key"
+    );
+    bc.put_secret(
+        ResourceScope::Global,
+        personal,
+        &PutSecretRequest {
+            secret: Secret::Key {
+                value: "personal-key".into(),
+            },
+            ..shared_key
+        },
+    )
+    .await?;
+    assert_eq!(
+        crate::harness_helpers::resolve_model(thread.as_ref(), &model)
+            .await?
+            .api_key,
+        "personal-key"
+    );
     assert!(thread.get_vault(&team.record().id).await?.is_none());
     let thread = thread.attach_vaults(vec![team.record().id]).await?;
     let vault = thread.get_vault(&team.record().id).await?.unwrap();
@@ -1059,13 +1133,6 @@ async fn shared_vaults_require_attachment_and_keep_writes_with_the_owner() -> Re
     )
     .await?;
     assert!(vault.get_secret(&secret).await.is_err());
-    let definition = exo_managed_agents::AgentDefinition::parse("---\nname: shared\nharness: basic\nconfig:\n  model: gpt-5-mini\n  credential: key\n---\nHelp.\n".into())?;
-    let mut model = crate::managed_agents::agent_config(
-        &definition,
-        exoharness::SandboxProvider::LocalProcess,
-        None,
-        None,
-    )?;
     let resolved = crate::harness_helpers::resolve_model(thread.as_ref(), &model).await?;
     assert_eq!(resolved.api_key, "rotated");
     model.base_url = Some("https://attacker.example".into());
@@ -1106,10 +1173,11 @@ async fn shared_vaults_require_attachment_and_keep_writes_with_the_owner() -> Re
     assert!(ac.delete_vault(team.record().id).await.is_err());
     ac.delete_secret(ResourceScope::Global, team.record().id, secret)
         .await?;
-    assert!(
+    assert_eq!(
         crate::harness_helpers::resolve_model(thread.as_ref(), &model)
-            .await
-            .is_err()
+            .await?
+            .api_key,
+        "personal-key"
     );
     let disposable = bc.create_vault("scratch").await?;
     bc.delete_vault(disposable.id).await?;
@@ -1222,22 +1290,45 @@ async fn host_configuration_requires_the_operator() -> Result<()> {
         "adapters: [inbox]",
     ] {
         let definition = exo_managed_agents::AgentDefinition::parse(format!(
-            "---\nname: worker\nharness: basic\nconfig:\n  model: test\n{extra}\n---\nWork"
+            "---\nharness: basic\nmodel:\n  name: test\n{extra}\n---\nWork"
         ))?;
         let error = runtime
-            .create_managed_agent(&definition, "worker")
+            .create_managed_agent(&definition, "worker", "worker")
             .await
             .err()
             .context("non-owner configured host execution")?;
         assert!(format!("{error:#}").contains("server owner"), "{error:#}");
     }
     let definition = exo_managed_agents::AgentDefinition::parse(
-        "---\nname: worker\nharness: basic\nconfig:\n  model: test\n---\nWork".into(),
+        "---\nharness: basic\nmodel:\n  name: test\n---\nWork".into(),
     )?;
-    let agent = runtime.create_managed_agent(&definition, "worker").await?;
+    let agent = runtime
+        .create_managed_agent(&definition, "worker", "worker")
+        .await?;
+    let error = runtime
+        .open_managed_thread(
+            &agent,
+            None,
+            Default::default(),
+            &exo_managed_agents::ThreadOptions {
+                harness: Some("module.ts".into()),
+                model: None,
+            },
+        )
+        .await
+        .err()
+        .context("non-owner selected a host module for a thread")?;
+    assert!(format!("{error:#}").contains("server owner"), "{error:#}");
+    assert!(
+        exo_managed_agents::list_threads(agent.as_ref())
+            .await?
+            .is_empty()
+    );
     let environment = exoharness::EnvironmentDefinition {
         name: "published".into(),
-        config: serde_json::from_value(json!({ "provider": "local-process", "image": "local" }))?,
+        provider: exoharness::SandboxProvider::LocalProcess,
+        image: "local".into(),
+        ..Default::default()
     };
     assert!(
         runtime

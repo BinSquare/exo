@@ -9,7 +9,6 @@ use executor::{
 };
 use exo_managed_agents::{self as managed, AgentDefinition};
 use exoharness::NewThreadRequest;
-use sha2::{Digest, Sha256};
 
 use crate::render::Verbosity;
 use crate::{Commands, HarnessSelection, SandboxProviderArg};
@@ -31,40 +30,76 @@ fn validate_new_thread_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default, Args)]
+pub struct AgentNameArgs {
+    /// Display name; defaults to frontmatter name, then the agent file's stem.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Saved agent slug; defaults to the display name converted to a slug.
+    #[arg(long)]
+    pub slug: Option<String>,
+}
+
+impl AgentNameArgs {
+    pub fn resolve(&self, definition: &AgentDefinition) -> Result<(String, String)> {
+        let name = self
+            .name
+            .as_deref()
+            .or(definition.frontmatter.name.as_deref())
+            .map(str::to_owned)
+            .or_else(|| definition.path()?.file_stem()?.to_str().map(str::to_owned))
+            .context("agent file has no filename; provide --name")?;
+        anyhow::ensure!(!name.trim().is_empty(), "agent name must not be empty");
+        let slug = self.slug.clone().unwrap_or_else(|| crate::slugify(&name));
+        anyhow::ensure!(
+            !slug.trim().is_empty(),
+            "agent slug resolved to an empty value"
+        );
+        Ok((name, slug))
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct ThreadArgs {
-    /// Sync a saved agent from a Markdown file and start or resume a saved thread.
-    #[arg(long, required_unless_present = "agent", conflicts_with = "agent")]
-    pub agent_file: Option<PathBuf>,
-    #[arg(long, required_unless_present = "agent_file")]
+    /// Agent Markdown file, or a saved agent's name or ID. Omit with --serve to serve all agents.
+    #[arg(value_name = "AGENT", required_unless_present = "serve")]
     pub agent: Option<String>,
+    #[command(flatten)]
+    pub identity: AgentNameArgs,
     /// Start a named thread, or resume it by slug or id if it already exists.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "serve")]
     pub thread: Option<String>,
     /// Override the model name for this thread.
     #[arg(long)]
     pub model: Option<String>,
     /// Attach a vault to the thread, including when resuming an existing thread.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "serve")]
     pub vault: Vec<String>,
     /// Use a saved environment from the selected provider.
-    #[arg(long, conflicts_with_all = ["environment_file", "provider", "sandbox_image"])]
+    #[arg(long, conflicts_with_all = ["environment_file", "provider", "sandbox_image", "serve"])]
     pub environment: Option<String>,
     /// Send an environment definition to the selected provider.
-    #[arg(long, conflicts_with_all = ["environment", "provider", "sandbox_image"])]
+    #[arg(long, conflicts_with_all = ["environment", "provider", "sandbox_image", "serve"])]
     pub environment_file: Option<PathBuf>,
-    #[arg(long = "sandbox", value_enum)]
+    #[arg(long = "sandbox", value_enum, conflicts_with = "serve")]
     provider: Option<SandboxProviderArg>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "serve")]
     sandbox_image: Option<String>,
     /// Mount a host directory: HOST_PATH:GUEST_PATH[:ro|rw].
-    #[arg(long = "mount", value_parser = crate::parse_sandbox_mount)]
+    #[arg(long = "mount", value_parser = crate::parse_sandbox_mount, conflicts_with = "serve")]
     mounts: Vec<FileSystemMount>,
     #[arg(long, value_enum, default_value_t = Verbosity::default())]
     pub verbosity: Verbosity,
 }
 
 impl ThreadArgs {
+    pub(crate) fn agent_file(&self) -> Option<&Path> {
+        self.agent.as_deref().map(Path::new).filter(|path| {
+            path.extension().is_some_and(|extension| extension == "md")
+                || path.components().count() > 1
+        })
+    }
+
     pub(crate) fn local_config(&self) -> Result<ConversationConfig> {
         if self.environment.is_some() || self.environment_file.is_some() {
             return Ok(ConversationConfig::default());
@@ -124,10 +159,15 @@ pub fn harness_selection(definition: &AgentDefinition) -> Result<HarnessSelectio
 
 pub fn load_definition(command: &Commands) -> Result<Option<AgentDefinition>> {
     let path = match command {
-        Commands::Agent {
-            command: crate::AgentCommands::Run { thread, .. },
-            ..
-        } => thread.agent_file.as_deref(),
+        Commands::Run { thread, .. } => {
+            let path = thread.agent_file();
+            anyhow::ensure!(
+                path.is_some()
+                    || (thread.identity.name.is_none() && thread.identity.slug.is_none()),
+                "--name and --slug require an agent file"
+            );
+            path
+        }
         Commands::Agent {
             command:
                 crate::AgentCommands::Create { file, .. } | crate::AgentCommands::Update { file, .. },
@@ -151,6 +191,37 @@ pub fn local_agent_config(
     )
 }
 
+pub async fn open_agent(
+    runtime: &Runtime,
+    definition: Option<&AgentDefinition>,
+    args: &ThreadArgs,
+) -> Result<Arc<dyn AgentHandle>> {
+    let mut progress = crate::turn_display::TurnProgress::new();
+    if let Some(definition) = definition {
+        let (name, slug) = args.identity.resolve(definition)?;
+        progress
+            .wait(async {
+                tracing::info!(target: "exoharness::progress", "Syncing agent resources...");
+                match runtime.get_agent(&slug).await? {
+                    Some(agent) => {
+                        runtime.update_managed_agent(&agent, definition).await?;
+                        Ok(agent)
+                    }
+                    None => runtime.create_managed_agent(definition, &name, &slug).await,
+                }
+            })
+            .await
+    } else {
+        crate::must_get_agent(
+            runtime,
+            args.agent
+                .as_deref()
+                .context("provide an agent file or saved agent name")?,
+        )
+        .await
+    }
+}
+
 pub async fn open_thread(
     runtime: &Runtime,
     definition: Option<&AgentDefinition>,
@@ -168,47 +239,13 @@ pub async fn open_thread(
     if egress_policy_selected
         && environment
             .as_ref()
-            .is_some_and(|environment| environment.config.policy.is_some())
+            .is_some_and(|environment| environment.policy().is_some())
     {
         bail!(
             "--egress-policy conflicts with the selected environment's policy; put the credential bindings in the environment policy or remove one policy"
         );
     }
-    let agent = if let Some(definition) = definition {
-        let path = args
-            .agent_file
-            .as_ref()
-            .context("provide --agent-file")?
-            .canonicalize()
-            .context("resolving agent file")?;
-        let name = path.file_stem().context("agent file has no filename")?;
-        let hash = format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()));
-        let slug = format!(
-            "{}-{}",
-            crate::slugify(&name.to_string_lossy()),
-            &hash[..16]
-        );
-        progress
-            .wait(async {
-                tracing::info!(target: "exoharness::progress", "Syncing agent resources...");
-                match runtime.get_agent(&slug).await? {
-                    Some(agent) => {
-                        runtime.update_managed_agent(&agent, definition).await?;
-                        Ok(agent)
-                    }
-                    None => runtime.create_managed_agent(definition, &slug).await,
-                }
-            })
-            .await?
-    } else {
-        crate::must_get_agent(
-            runtime,
-            args.agent
-                .as_deref()
-                .context("provide --agent-file or --agent")?,
-        )
-        .await?
-    };
+    let agent = open_agent(runtime, definition, args).await?;
     let saved_thread = match args.thread.as_deref() {
         Some(reference) => managed::get_thread(agent.as_ref(), reference).await?,
         None => None,
@@ -220,7 +257,7 @@ pub async fn open_thread(
                 .record()
                 .environment
                 .as_ref()
-                .is_some_and(|environment| environment.config.policy.is_some())
+                .is_some_and(|environment| environment.policy().is_some())
         })
     {
         bail!(
@@ -235,10 +272,7 @@ pub async fn open_thread(
     .await?;
     if let Some(environment) = &mut environment {
         for mount in &args.mounts {
-            let mounts = environment
-                .config
-                .file_system_mounts
-                .get_or_insert_default();
+            let mounts = environment.file_system_mounts.get_or_insert_default();
             let mut mount = mount.clone();
             mount.host_path = crate::canonicalize_directory(Path::new(&mount.host_path))?
                 .to_string_lossy()
@@ -267,9 +301,10 @@ pub async fn open_thread(
             NewThreadRequest {
                 environment,
                 vaults: vaults.iter().map(|vault| vault.record().id).collect(),
-                slug: Some(slug.clone()),
-                name: Some(slug),
+                slug: Some(slug),
+                name: args.thread.clone(),
             },
+            &Default::default(),
         ))
         .await?;
     println!("agent: {} ({})", agent.record().slug, agent.record().id);
@@ -291,7 +326,7 @@ pub async fn open_thread(
     }
     progress.set_status(Some("Checking model credentials".into()));
     let config = progress
-        .wait(runtime.get_agent_config(agent.as_ref()))
+        .wait(runtime.get_thread_agent_config(agent.as_ref(), opened.thread.as_ref()))
         .await?;
     if let Some(name) = config.credential.as_deref() {
         let reference = progress.wait(exoharness::vault::find_secret(opened.thread.as_ref(), name))
@@ -351,7 +386,11 @@ pub async fn list_threads(harness: &Runtime, agent: &str) -> Result<()> {
                 vec![
                     record.slug.clone(),
                     record.id.to_string(),
-                    record.name.clone(),
+                    if record.name.is_empty() {
+                        "Untitled".into()
+                    } else {
+                        record.name.clone()
+                    },
                 ]
             })
             .collect(),

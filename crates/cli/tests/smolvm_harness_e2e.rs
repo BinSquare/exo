@@ -1,4 +1,4 @@
-//! An exo agent runs a command in a smolvm microVM through the whole harness:
+//! An exo runs a command in a smolvm microVM through the whole harness:
 //! agent → `create_sandbox` → `run_in_sandbox` → streamed stdout, so a break in
 //! the wiring shows up here rather than in the backend-only tests.
 //!

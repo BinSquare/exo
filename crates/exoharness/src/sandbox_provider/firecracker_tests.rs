@@ -1412,7 +1412,7 @@ async fn resource_disks_live_isolate_resume_and_enforce_read_only() -> Result<()
         .into_iter()
         .map(|(name, path, mode)| crate::resources::ResourceDefinition {
             name: name.into(),
-            mount_path: path.into(),
+            mount_path: Some(path.into()),
             mode,
             source: crate::resources::ResourceSource::Directory {
                 path: source.clone(),

@@ -130,14 +130,14 @@ async fn conversation_send_round_trips_through_real_sandbox_and_mocked_openai() 
         &xdg,
     );
     let spec = root_dir.path().join("agent.md");
-    std::fs::write(&spec, format!("---\nname: Integration Test Agent\nharness: basic\nconfig:\n  model: gpt-test\n  credential: test-key\n  base_url: {}\n---\nReply to the user.\n", mock_server.uri())).unwrap();
+    std::fs::write(&spec, format!("---\nharness: basic\nmodel:\n  name: gpt-test\n  credential: test-key\n  base_url: {}\n---\nReply to the user.\n", mock_server.uri())).unwrap();
     run_exo(
         &[
             "agent",
             "create",
-            "test-agent",
-            "--file",
             spec.to_str().unwrap(),
+            "--name",
+            "test-agent",
         ],
         &root,
         &xdg,
@@ -166,7 +166,6 @@ async fn conversation_send_round_trips_through_real_sandbox_and_mocked_openai() 
     // the CLI and prove it reached a guest kernel before exercising model I/O.
     let guest = run_exo(
         &[
-            "thread",
             "sandbox",
             "run",
             "test-agent",

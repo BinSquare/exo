@@ -320,15 +320,6 @@ enum HarnessSelection {
     TypeScriptModule(PathBuf),
 }
 
-impl HarnessSelection {
-    fn harness_kind(&self) -> HarnessKind {
-        match self {
-            Self::Kind(kind) => *kind,
-            Self::TypeScriptPreset(_) | Self::TypeScriptModule(_) => HarnessKind::TypeScript,
-        }
-    }
-}
-
 impl FromStr for HarnessSelection {
     type Err = String;
 
@@ -451,7 +442,7 @@ fn build_exo_config(cli: &Cli, state_root: &Path) -> Result<BasicExoHarnessConfi
 #[cfg(feature = "firecracker")]
 fn command_firecracker_args(command: &Commands) -> Option<&FirecrackerArgs> {
     match command {
-        Commands::Serve { args, .. } => Some(&args.firecracker),
+        Commands::Run { service, .. } => Some(&service.firecracker),
         _ => None,
     }
 }
@@ -510,9 +501,10 @@ impl Cli {
         match &self.command {
             Commands::Environment { runtime, .. }
             | Commands::Vault { runtime, .. }
-            | Commands::Serve { runtime, .. }
+            | Commands::Run { runtime, .. }
             | Commands::Agent { runtime, .. }
-            | Commands::Conversation { runtime, .. } => runtime,
+            | Commands::Conversation { runtime, .. }
+            | Commands::Sandbox { runtime, .. } => runtime,
             Commands::Provider { .. } | Commands::FirecrackerBridge => {
                 unreachable!("command does not use runtime options")
             }
@@ -529,15 +521,11 @@ impl Cli {
 
     fn execution(&self) -> Option<&ExecutionArgs> {
         match &self.command {
-            Commands::Agent {
-                command: AgentCommands::Run { execution, .. },
-                ..
-            }
+            Commands::Run { execution, .. }
             | Commands::Conversation {
                 command: ConversationCommands::Send { execution, .. },
                 ..
             } => Some(execution),
-            Commands::Serve { args, .. } => Some(&args.execution),
             _ => None,
         }
     }
@@ -552,6 +540,13 @@ enum Commands {
         #[command(subcommand)]
         command: environment::EnvironmentCommands,
     },
+    /// Manage sandbox execution and externally provisioned environments.
+    Sandbox {
+        #[command(flatten)]
+        runtime: RuntimeArgs,
+        #[command(subcommand)]
+        command: SandboxCommands,
+    },
     /// Manage vaults and their credentials, including MCP login.
     Vault {
         #[command(flatten)]
@@ -561,14 +556,27 @@ enum Commands {
     },
     #[command(hide = true)]
     FirecrackerBridge,
-    /// Serve agents and vaults over HTTP.
-    Serve {
+    /// Run an agent in the terminal, or serve it over HTTP with --serve.
+    Run {
         #[command(flatten)]
         runtime: RuntimeArgs,
         #[command(flatten)]
-        args: Box<serve::ServeArgs>,
+        execution: ExecutionArgs,
+        #[command(flatten)]
+        thread: Box<managed_agents::ThreadArgs>,
+        /// Execute one prompt and exit.
+        #[arg(long, conflicts_with_all = ["tui", "serve"])]
+        prompt: Option<String>,
+        /// Use the full-screen TUI.
+        #[arg(long, conflicts_with = "serve")]
+        tui: bool,
+        /// Serve the HTTP API and supervise adapters instead of opening terminal chat.
+        #[arg(long)]
+        serve: bool,
+        #[command(flatten, next_help_heading = "Server options")]
+        service: Box<serve::ServeArgs>,
     },
-    /// Create and run agents from Markdown specs.
+    /// Manage saved agents and their Markdown specs.
     Agent {
         #[command(flatten)]
         runtime: RuntimeArgs,
@@ -595,29 +603,15 @@ enum AgentCommands {
     List,
     /// Save an agent from a Markdown spec.
     Create {
-        name: String,
-        #[arg(long)]
         file: PathBuf,
-        #[arg(long)]
-        slug: Option<String>,
+        #[command(flatten)]
+        identity: managed_agents::AgentNameArgs,
     },
     /// Replace a saved agent's spec.
     Update {
-        agent: String,
-        #[arg(long)]
         file: PathBuf,
-    },
-    /// Run interactively, or execute one prompt with --prompt.
-    Run {
         #[command(flatten)]
-        execution: ExecutionArgs,
-        #[command(flatten)]
-        thread: Box<managed_agents::ThreadArgs>,
-        #[arg(long, conflicts_with = "tui")]
-        prompt: Option<String>,
-        /// Use the full-screen TUI.
-        #[arg(long)]
-        tui: bool,
+        identity: managed_agents::AgentNameArgs,
     },
     Mount {
         #[command(subcommand)]
@@ -709,10 +703,6 @@ enum ConversationCommands {
         #[command(subcommand)]
         command: ConversationMountCommands,
     },
-    Sandbox {
-        #[command(subcommand)]
-        command: ConversationSandboxCommands,
-    },
     #[command(alias = "show")]
     Get {
         agent: String,
@@ -768,7 +758,7 @@ enum ConversationCommands {
 }
 
 #[derive(Debug, Subcommand)]
-enum ConversationSandboxCommands {
+enum SandboxCommands {
     /// Forward a local TCP listener to a published port in a running thread sandbox.
     Forward {
         agent: String,
@@ -946,16 +936,10 @@ impl std::fmt::Debug for CliError {
 async fn main() -> Result<(), CliError> {
     let cli = Cli::parse();
     let verbose = matches!(&cli.command,
-        Commands::Agent { command: AgentCommands::Run { thread, .. }, .. }
+        Commands::Run { thread, .. }
         if thread.verbosity == Verbosity::Full
     );
-    if matches!(
-        &cli.command,
-        Commands::Agent {
-            command: AgentCommands::Run { .. },
-            ..
-        }
-    ) {
+    if matches!(&cli.command, Commands::Run { serve: false, .. }) {
         turn_display::init_progress(verbose).map_err(|error| CliError { error, verbose })?;
     }
     run(cli).await.map_err(|error| CliError { error, verbose })
@@ -982,7 +966,7 @@ async fn run(mut cli: Cli) -> Result<()> {
     if let Commands::Provider { command } = &cli.command {
         return providers::run(command.as_ref(), &mut provider_store).await;
     }
-    let serving = matches!(cli.command, Commands::Serve { .. });
+    let serving = matches!(cli.command, Commands::Run { serve: true, .. });
     let (agent, thread) = command_refs_mut(&mut cli.command);
     let selected_provider = if serving && cli.provider_profile.is_none() {
         None
@@ -1083,10 +1067,7 @@ async fn run_selected(
     if !local
         && matches!(
             &cli.command,
-            Commands::Agent {
-                command: AgentCommands::Run { execution, .. },
-                ..
-            } if execution.egress_policy.is_some()
+            Commands::Run { execution, .. } if execution.egress_policy.is_some()
         )
     {
         bail!("--egress-policy is local-only; put the policy in the remote environment definition");
@@ -1111,7 +1092,15 @@ async fn run_selected(
             unreachable!("management commands return before harness startup")
         }
         Commands::Vault { command, .. } => vaults::run(harness.exoharness_handle().as_ref(), &command, &env_vars, local).await?,
-        Commands::Agent { command: AgentCommands::Run { thread, tui, prompt, execution, .. }, .. } => {
+        Commands::Run { thread, serve: true, service, .. } => {
+            let agent = if thread.agent.is_some() {
+                Some(managed_agents::open_agent(harness.as_ref(), definition.as_ref(), &thread).await?.record().id)
+            } else {
+                None
+            };
+            serve::run(harness.clone(), state_root.as_deref().context("server requires local state")?, *service, agent).await?;
+        }
+        Commands::Run { thread, tui, prompt, execution, .. } => {
             let (agent, conversation) = managed_agents::open_thread(
                 harness.as_ref(),
                 definition.as_ref(),
@@ -1154,11 +1143,7 @@ async fn run_selected(
                 run_chat_repl(Arc::clone(&harness), agent, conversation, thread.verbosity).await?;
             }
         }
-        Commands::Serve { args, .. } => {
-            serve::run(harness.clone(), state_root.as_deref().context("server requires local state")?, *args).await?;
-        }
         Commands::Agent { command, .. } => match command {
-            AgentCommands::Run { .. } => unreachable!(),
             AgentCommands::List => {
                 let agents = harness.list_agents().await?;
                 print_table(
@@ -1171,24 +1156,25 @@ async fn run_selected(
                         .collect(),
                 )?;
             }
-            AgentCommands::Create { name, file: _, slug } => {
-                let slug = slug.unwrap_or_else(|| slugify(&name));
-                anyhow::ensure!(!slug.is_empty(), "agent slug resolved to an empty value");
+            AgentCommands::Create { identity, file: _ } => {
                 let definition = definition.as_ref().context("agent spec is required")?;
+                let (name, slug) = identity.resolve(definition)?;
                 if selected_provider.is_some() {
                     provider_store.ensure_agent_alias_available(&slug)?;
                 }
                 eprintln!("Preparing agent resources...");
-                let agent = harness.create_managed_agent(definition, &slug).await?;
+                let agent = harness.create_managed_agent(definition, &name, &slug).await?;
                 if let Some(provider) = &selected_provider {
                     provider_store.pin_agent(agent.record().slug.clone(), provider.selection, &provider.account, agent.record().id)?;
                 }
                 println!("created agent {} ({})", agent.record().slug, agent.record().id);
             }
-            AgentCommands::Update { agent, file: _ } => {
-                let agent = must_get_agent(harness.as_ref(), &agent).await?;
+            AgentCommands::Update { identity, file: _ } => {
+                let definition = definition.as_ref().context("agent spec is required")?;
+                let (_, slug) = identity.resolve(definition)?;
+                let agent = must_get_agent(harness.as_ref(), &slug).await?;
                 eprintln!("Preparing agent resources...");
-                harness.update_managed_agent(&agent, definition.as_ref().context("agent spec is required")?).await?;
+                harness.update_managed_agent(&agent, definition).await?;
                 println!("updated agent {}", agent.record().slug);
             }
             AgentCommands::Mount { command } => match command {
@@ -1353,6 +1339,89 @@ async fn run_selected(
                     provider_store.unpin_agent(&provider.selection.name, &provider.account, record.id)?;
                 }
                 println!("deleted agent {}", agent);
+            }
+        },
+        Commands::Sandbox { command, .. } => match command {
+            SandboxCommands::Forward {
+                agent,
+                conversation,
+                port,
+                bind,
+            } => {
+                let conversation =
+                    must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
+                port_forward::run(conversation, port, bind).await?;
+            }
+            SandboxCommands::Attach {
+                agent,
+                conversation,
+                provider,
+                external_id,
+                default_workdir,
+            } => {
+                let provider = SandboxProvider::from(provider);
+                let attachment = if provider == SandboxProvider::Docker {
+                    SandboxAttachment::DockerContainer {
+                        container_id: external_id,
+                    }
+                } else {
+                    bail!(
+                        "sandbox provider {} does not support external attachments",
+                        provider.as_str()
+                    )
+                };
+                let conversation =
+                    must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
+                let sandbox_id = conversation
+                    .attach_sandbox(AttachSandboxRequest {
+                        attachment,
+                        default_workdir,
+                    })
+                    .await?;
+                println!(
+                    "attached Docker container as sandbox {} for {}",
+                    sandbox_id,
+                    conversation.record().slug
+                );
+            }
+            SandboxCommands::Detach {
+                agent,
+                conversation,
+                sandbox_id,
+            } => {
+                let conversation =
+                    must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
+                let attachment = conversation
+                    .detach_sandbox(sandbox_id.clone())
+                    .await?;
+                println!(
+                    "detached sandbox {} from {}: {}",
+                    sandbox_id,
+                    conversation.record().slug,
+                    serde_json::to_string(&attachment)?
+                );
+            }
+            SandboxCommands::Run {
+                agent,
+                conversation,
+                command,
+            } => {
+                let agent_handle = must_get_agent(harness.as_ref(), &agent).await?;
+                let conversation = harness
+                    .get_conversation(agent_handle.as_ref(), &conversation)
+                    .await?
+                    .ok_or_else(|| anyhow!("conversation not found: {}", conversation))?;
+                let output = run_sandbox_shell_command(
+                    agent_handle.as_ref(),
+                    conversation.as_ref(),
+                    command,
+                )
+                .await?;
+                io::stdout().write_all(output.stdout.as_bytes())?;
+                io::stderr().write_all(output.stderr.as_bytes())?;
+                if output.exit_code != 0 {
+                    bail!("sandbox command exited with status {}", output.exit_code);
+                }
             }
         },
         Commands::Conversation { command, .. } => match command {
@@ -1622,89 +1691,6 @@ async fn run_selected(
                     );
                 }
             },
-            ConversationCommands::Sandbox { command, .. } => match command {
-                ConversationSandboxCommands::Forward {
-                    agent,
-                    conversation,
-                    port,
-                    bind,
-                } => {
-                    let conversation =
-                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
-                    port_forward::run(conversation, port, bind).await?;
-                }
-                ConversationSandboxCommands::Attach {
-                    agent,
-                    conversation,
-                    provider,
-                    external_id,
-                    default_workdir,
-                } => {
-                    let provider = SandboxProvider::from(provider);
-                    let attachment = if provider == SandboxProvider::Docker {
-                        SandboxAttachment::DockerContainer {
-                            container_id: external_id,
-                        }
-                    } else {
-                        bail!(
-                            "sandbox provider {} does not support external attachments",
-                            provider.as_str()
-                        )
-                    };
-                    let conversation =
-                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
-                    let sandbox_id = conversation
-                        .attach_sandbox(AttachSandboxRequest {
-                            attachment,
-                            default_workdir,
-                        })
-                        .await?;
-                    println!(
-                        "attached Docker container as sandbox {} for {}",
-                        sandbox_id,
-                        conversation.record().slug
-                    );
-                }
-                ConversationSandboxCommands::Detach {
-                    agent,
-                    conversation,
-                    sandbox_id,
-                } => {
-                    let conversation =
-                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
-                    let attachment = conversation
-                        .detach_sandbox(sandbox_id.clone())
-                        .await?;
-                    println!(
-                        "detached sandbox {} from {}: {}",
-                        sandbox_id,
-                        conversation.record().slug,
-                        serde_json::to_string(&attachment)?
-                    );
-                }
-                ConversationSandboxCommands::Run {
-                    agent,
-                    conversation,
-                    command,
-                } => {
-                    let agent_handle = must_get_agent(harness.as_ref(), &agent).await?;
-                    let conversation = harness
-                        .get_conversation(agent_handle.as_ref(), &conversation)
-                        .await?
-                        .ok_or_else(|| anyhow!("conversation not found: {}", conversation))?;
-                    let output = run_sandbox_shell_command(
-                        agent_handle.as_ref(),
-                        conversation.as_ref(),
-                        command,
-                    )
-                    .await?;
-                    io::stdout().write_all(output.stdout.as_bytes())?;
-                    io::stderr().write_all(output.stderr.as_bytes())?;
-                    if output.exit_code != 0 {
-                        bail!("sandbox command exited with status {}", output.exit_code);
-                    }
-                }
-            },
             ConversationCommands::Get {
                 agent,
                 conversation,
@@ -1917,17 +1903,23 @@ async fn run_selected(
 
 fn command_refs_mut(command: &mut Commands) -> (Option<&mut String>, Option<&mut String>) {
     match command {
+        Commands::Run { thread, .. } => {
+            let file = thread.agent_file().is_some();
+            (
+                if file { None } else { thread.agent.as_mut() },
+                thread.thread.as_mut(),
+            )
+        }
         Commands::Agent { command, .. } => match command {
-            AgentCommands::Update { agent, .. }
-            | AgentCommands::Get { agent }
-            | AgentCommands::Delete { agent } => (Some(agent), None),
+            AgentCommands::Get { agent } | AgentCommands::Delete { agent } => (Some(agent), None),
             AgentCommands::Mount { command } => match command {
                 AgentMountCommands::List { agent }
                 | AgentMountCommands::Create { agent, .. }
                 | AgentMountCommands::Delete { agent, .. } => (Some(agent), None),
             },
-            AgentCommands::Run { thread, .. } => (thread.agent.as_mut(), thread.thread.as_mut()),
-            AgentCommands::List | AgentCommands::Create { .. } => (None, None),
+            AgentCommands::List | AgentCommands::Create { .. } | AgentCommands::Update { .. } => {
+                (None, None)
+            }
         },
         Commands::Conversation { command, .. } => match command {
             ConversationCommands::List { agent } | ConversationCommands::Create { agent, .. } => {
@@ -1981,35 +1973,34 @@ fn command_refs_mut(command: &mut Commands) -> (Option<&mut String>, Option<&mut
                     ..
                 } => (Some(agent), Some(conversation)),
             },
-            ConversationCommands::Sandbox { command, .. } => match command {
-                ConversationSandboxCommands::Forward {
-                    agent,
-                    conversation,
-                    ..
-                }
-                | ConversationSandboxCommands::Attach {
-                    agent,
-                    conversation,
-                    ..
-                }
-                | ConversationSandboxCommands::Detach {
-                    agent,
-                    conversation,
-                    ..
-                }
-                | ConversationSandboxCommands::Run {
-                    agent,
-                    conversation,
-                    ..
-                } => (Some(agent), Some(conversation)),
-            },
             ConversationCommands::CompleteRebuildUpdate { .. } => (None, None),
+        },
+        Commands::Sandbox { command, .. } => match command {
+            SandboxCommands::Forward {
+                agent,
+                conversation,
+                ..
+            }
+            | SandboxCommands::Attach {
+                agent,
+                conversation,
+                ..
+            }
+            | SandboxCommands::Detach {
+                agent,
+                conversation,
+                ..
+            }
+            | SandboxCommands::Run {
+                agent,
+                conversation,
+                ..
+            } => (Some(agent), Some(conversation)),
         },
         Commands::FirecrackerBridge
         | Commands::Provider { .. }
         | Commands::Environment { .. }
         | Commands::Vault { .. } => (None, None),
-        Commands::Serve { args, .. } => (args.agent.as_mut(), None),
     }
 }
 
@@ -2025,15 +2016,6 @@ fn init_firecracker_bridge_tracing() {
     }
 }
 
-fn to_agent_harness_kind(kind: HarnessKind) -> AgentHarnessKind {
-    match kind {
-        HarnessKind::Basic => AgentHarnessKind::Basic,
-        HarnessKind::Rlm => AgentHarnessKind::Rlm,
-        HarnessKind::TypeScript => AgentHarnessKind::TypeScript,
-        HarnessKind::Exo => AgentHarnessKind::Exo,
-    }
-}
-
 fn format_harness_kind(kind: AgentHarnessKind) -> &'static str {
     match kind {
         AgentHarnessKind::Basic => "basic",
@@ -2045,62 +2027,6 @@ fn format_harness_kind(kind: AgentHarnessKind) -> &'static str {
 
 fn format_sandbox_provider(provider: &SandboxProvider) -> &str {
     provider.as_str()
-}
-
-async fn ensure_agent_matches_harness_selection(
-    agent: &dyn AgentHandle,
-    selection: &HarnessSelection,
-) -> Result<()> {
-    let config = executor::load_agent_config(agent).await?;
-    let expected = to_agent_harness_kind(selection.harness_kind());
-    if config.harness != expected {
-        bail!(
-            "agent {} is configured for {}; --harness {} requires {}",
-            agent.record().slug,
-            format_harness_kind(config.harness),
-            format_harness_selection(selection),
-            format_harness_kind(expected)
-        );
-    }
-
-    if matches!(
-        selection.harness_kind(),
-        HarnessKind::TypeScript | HarnessKind::Exo
-    ) && config.typescript.is_none()
-    {
-        bail!(
-            "agent {} is configured for {} but has no module path",
-            agent.record().slug,
-            format_harness_selection(selection)
-        );
-    }
-
-    let module = match selection {
-        HarnessSelection::TypeScriptPreset(preset) => Some(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join(preset.module_path()),
-        ),
-        HarnessSelection::TypeScriptModule(module) => Some(module.clone()),
-        HarnessSelection::Kind(_) => None,
-    };
-    if let Some(module) = module {
-        let expected = module.canonicalize()?.to_string_lossy().into_owned();
-        let actual = config
-            .typescript
-            .as_ref()
-            .context("agent has no TypeScript module")?;
-        anyhow::ensure!(
-            actual.module_path == expected,
-            "agent {} uses TypeScript module {}; --harness {} resolved to {}",
-            agent.record().slug,
-            actual.module_path,
-            format_harness_selection(selection),
-            expected
-        );
-    }
-
-    Ok(())
 }
 
 fn looks_like_typescript_module_path(value: &str) -> bool {
@@ -2331,7 +2257,7 @@ async fn run_sandbox_shell_command(
 }
 
 fn chat_command(agent_slug: &str, conversation_slug: &str) -> String {
-    format!("exo agent run --agent {agent_slug} --thread {conversation_slug}")
+    format!("exo run {agent_slug} --thread {conversation_slug}")
 }
 
 fn sandbox_scope_name(scope: SandboxScope) -> &'static str {
@@ -2442,10 +2368,10 @@ mod command_tests {
         for command in [
             "chat",
             "run",
+            "serve",
             "secret",
             "model",
             "sandbox-provider",
-            "sandbox",
             "environments",
             "tools",
             "adapters",
@@ -2453,10 +2379,13 @@ mod command_tests {
             assert!(Cli::try_parse_from(["exo", command]).is_err());
         }
         for args in [
-            vec!["agent", "create", "support", "--file", "agent.md"],
-            vec!["agent", "update", "support", "--file", "agent.md"],
-            vec!["serve", "--agent", "support"],
+            vec!["agent", "create", "agent.md", "--name", "support"],
+            vec!["agent", "update", "agent.md", "--name", "support"],
+            vec!["run", "--serve", "support"],
+            vec!["run", "--serve"],
+            vec!["run", "agent.md", "--serve"],
             vec!["environment", "provider", "list"],
+            vec!["sandbox", "run", "support", "thread", "pwd"],
         ] {
             Cli::try_parse_from(["exo"].into_iter().chain(args)).unwrap();
         }
@@ -2478,12 +2407,13 @@ mod command_tests {
             vec![
                 "vault", "secret", "update", "team", "github", "--scope", "repo",
             ],
-            vec!["agent", "serve", "support"],
+            vec!["agent", "run", "support"],
             vec!["agent", "create", "support", "--model", "test"],
             vec!["agent", "--exoharness-url", "http://localhost", "list"],
-            vec![
-                "agent", "run", "--agent", "support", "--tui", "--prompt", "hi",
-            ],
+            vec!["run", "support", "--tui", "--prompt", "hi"],
+            vec!["run", "support", "--serve", "--prompt", "hi"],
+            vec!["run", "support", "--serve", "--thread", "saved"],
+            vec!["run", "support", "--bind", "127.0.0.1:8080"],
         ] {
             assert!(Cli::try_parse_from(["exo"].into_iter().chain(args)).is_err());
         }
@@ -2538,9 +2468,9 @@ mod command_tests {
             assert!(help.contains("--env-file"), "{help}");
         }
         for command in [
-            vec!["agent", "run", "--agent", "test"],
+            vec!["run", "test"],
             vec!["thread", "send", "test", "thread", "hi"],
-            vec!["serve"],
+            vec!["run", "--serve"],
         ] {
             let cli = Cli::try_parse_from(["exo"].into_iter().chain(command).chain([
                 "--pricing-path",
@@ -2562,9 +2492,7 @@ mod command_tests {
         for prompt in [None, Some("hello")] {
             let mut args = vec![
                 "exo",
-                "agent",
                 "run",
-                "--agent",
                 "support",
                 "--thread",
                 "saved",
@@ -2576,15 +2504,35 @@ mod command_tests {
             }
             let cli = Cli::try_parse_from(args).unwrap();
             assert!(matches!(cli.command,
-                Commands::Agent { command: AgentCommands::Run { thread, prompt: actual, .. }, .. }
+                Commands::Run { thread, prompt: actual, .. }
                 if thread.agent.as_deref() == Some("support") && thread.thread.as_deref() == Some("saved")
                     && actual.as_deref() == prompt
             ));
         }
         assert_eq!(
             chat_command("support", "saved"),
-            "exo agent run --agent support --thread saved"
+            "exo run support --thread saved"
         );
+        for (reference, file) in [
+            ("support", false),
+            ("support.md", true),
+            ("./support", true),
+            ("agents/support.md", true),
+            ("/tmp/support", true),
+        ] {
+            let mut cli =
+                Cli::try_parse_from(["exo", "run", reference, "--thread", "saved"]).unwrap();
+            let (agent, thread) = command_refs_mut(&mut cli.command);
+            assert_eq!(
+                agent.as_deref().map(String::as_str),
+                (!file).then_some(reference)
+            );
+            assert_eq!(thread.as_deref().map(String::as_str), Some("saved"));
+            let Commands::Run { thread, .. } = &cli.command else {
+                unreachable!()
+            };
+            assert_eq!(thread.agent_file().is_some(), file);
+        }
     }
 
     #[cfg(unix)]

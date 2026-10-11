@@ -1,4 +1,12 @@
 import DefaultTheme from "vitepress/theme";
+import { h } from "vue";
+import ThemeSwitch from "./ThemeSwitch.vue";
 import "./custom.css";
 
-export default DefaultTheme;
+export default {
+  extends: DefaultTheme,
+  Layout: () =>
+    h(DefaultTheme.Layout, null, {
+      "nav-bar-content-after": () => h(ThemeSwitch),
+    }),
+};

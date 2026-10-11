@@ -695,7 +695,7 @@ async fn http_vault_contexts_and_secrets_round_trip() -> crate::Result<()> {
     let sibling = sibling.attach_vaults(vaults.clone()).await?;
     let environment = crate::EnvironmentDefinition {
         name: "updated".into(),
-        config: crate::CreateSandboxRequest {
+        ..(crate::CreateSandboxRequest {
             tcp_ports: vec![],
             provider: SandboxProvider::LocalProcess,
             image: "local".into(),
@@ -708,7 +708,8 @@ async fn http_vault_contexts_and_secrets_round_trip() -> crate::Result<()> {
             durable_file_systems: None,
             policy: None,
             idle_seconds: None,
-        },
+        })
+        .into()
     };
     let sibling = sibling.update_environment(environment.clone()).await?;
     assert_eq!(sibling.record().environment.as_ref(), Some(&environment));

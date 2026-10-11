@@ -2445,7 +2445,7 @@ async fn deleting_stopped_remote_sandboxes_does_not_require_the_provider() -> cr
     first_reloaded
         .update_environment(crate::EnvironmentDefinition {
             name: "local".into(),
-            config: crate::test_support::sandbox_request(),
+            ..(crate::test_support::sandbox_request()).into()
         })
         .await?;
     assert!(first_reloaded.list_sandboxes().await?.is_empty());

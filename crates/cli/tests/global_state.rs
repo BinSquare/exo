@@ -33,10 +33,7 @@ fn default_local_state_is_shared_across_directories_and_root_overrides_it() -> R
     }
     std::fs::write(home.join("prices.json"), "{}")?;
     let file = temp.path().join("environment.yaml");
-    std::fs::write(
-        &file,
-        "name: dev\nconfig:\n  provider: local_process\n  image: unused\n",
-    )?;
+    std::fs::write(&file, "name: dev\nprovider: local_process\nimage: unused\n")?;
     run(
         &home,
         &first,

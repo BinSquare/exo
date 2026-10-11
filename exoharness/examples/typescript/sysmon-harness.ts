@@ -1,7 +1,7 @@
 // Tutorial harness: a small "system monitor" agent with a dedicated tool and
 // a custom context-building step that injects live host memory utilization
 // into the prompt on every model round. See docs-site tutorial
-// "Write Your Own Agent".
+// "Custom harness".
 
 import os from "node:os";
 
@@ -54,15 +54,7 @@ async function registerSysmonTools(
   tools: HarnessToolRegistry,
   context: TurnContext,
 ): Promise<void> {
-  // Existing tools that ship with exo. shell runs commands in the sandbox;
-  // install_agent_tool / uninstall_agent_tool let the agent write and remove
-  // its own tools at runtime.
-  registerBuiltInTools(tools, context, [
-    "shell",
-    "install_agent_tool",
-    "uninstall_agent_tool",
-  ]);
-  // Our custom tool.
+  registerBuiltInTools(tools, context, ["shell"]);
   await registerLibraryTools(tools, context, systemInfoTool);
 }
 

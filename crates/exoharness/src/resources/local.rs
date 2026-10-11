@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{GitCheckout, GitCredential, PreparedResource, ResourceDefinition, ResourceSource};
+use super::{GitCredential, PreparedResource, ResourceDefinition, ResourceSource};
 use crate::local_volume::{clone_volume, create_volume, mount_volume, unmount_volume};
 use crate::{AgentId, FileSystemMount, ResourceScope, ThreadId};
 
@@ -204,7 +204,7 @@ impl ResourceStore {
                 };
                 Ok(FileSystemMount {
                     host_path: path.to_string_lossy().into_owned(),
-                    mount_path: definition.mount_path.clone(),
+                    mount_path: definition.mount_path().into_owned(),
                     mode: definition.mode,
                     internal: Some(true),
                 })
@@ -243,16 +243,19 @@ impl ResourceStore {
             let definition = resource.definition;
             if !matches!(definition.source, ResourceSource::GitRepository { .. })
                 || !mounts.iter().any(|mount| {
-                    mount.internal == Some(true) && mount.mount_path == definition.mount_path
+                    mount.internal == Some(true) && mount.mount_path == definition.mount_path()
                 })
             {
                 continue;
             }
             ensure!(
-                !Path::new(&definition.mount_path).ends_with("*"),
+                !Path::new(definition.mount_path().as_ref()).ends_with("*"),
                 "Git resource mount_path cannot end with '/*': Git treats it as a trust wildcard"
             );
-            let mut settings = vec![("safe.directory".to_owned(), definition.mount_path.clone())];
+            let mut settings = vec![(
+                "safe.directory".to_owned(),
+                definition.mount_path().into_owned(),
+            )];
             if let ResourceSource::GitRepository {
                 url: Some(url),
                 credential: Some(_),
@@ -403,6 +406,68 @@ impl ResourceStore {
         Ok(())
     }
 
+    fn resolve_checkout(
+        &self,
+        workspace: &Path,
+        checkout: Option<&str>,
+        credential: Option<&GitCredential>,
+    ) -> Result<(Option<String>, String)> {
+        let branch = match checkout {
+            Some(reference) => {
+                let remote_ref = format!("refs/remotes/origin/{reference}");
+                let branches = self.git(
+                    workspace,
+                    [
+                        "for-each-ref",
+                        "--format=%(refname)",
+                        "refs/remotes/origin/",
+                    ],
+                    None,
+                )?;
+                branches
+                    .lines()
+                    .any(|branch| branch == remote_ref)
+                    .then(|| reference.to_owned())
+            }
+            None => {
+                let refs = self.git(
+                    workspace,
+                    ["ls-remote", "--symref", "origin", "HEAD"],
+                    credential,
+                )?;
+                Some(
+                    refs.lines()
+                        .find_map(|line| {
+                            line.strip_prefix("ref: refs/heads/")?
+                                .strip_suffix("\tHEAD")
+                        })
+                        .context("Git remote has no default branch")?
+                        .to_owned(),
+                )
+            }
+        };
+        let reference = match (&branch, checkout) {
+            (Some(name), _) => format!("refs/remotes/origin/{name}"),
+            (_, Some(reference))
+                if matches!(reference.len(), 40 | 64)
+                    && reference.bytes().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                reference.to_owned()
+            }
+            (_, Some(tag)) => format!("refs/tags/{tag}"),
+            _ => unreachable!(),
+        };
+        let revision = self
+            .git(
+                workspace,
+                ["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+                None,
+            )?
+            .trim()
+            .to_owned();
+        Ok((branch, revision))
+    }
+
     fn clone_git_resource(
         &self,
         definition: &ResourceDefinition,
@@ -458,39 +523,8 @@ impl ResourceStore {
                 self.cancel.as_ref(),
                 Some(repository),
             )?;
-            let branch = match checkout {
-                Some(GitCheckout::Branch { name }) => Some(name.clone()),
-                Some(GitCheckout::Commit { .. }) => None,
-                None => {
-                    let refs = self.git(
-                        &workspace,
-                        ["ls-remote", "--symref", "origin", "HEAD"],
-                        credential,
-                    )?;
-                    Some(
-                        refs.lines()
-                            .find_map(|line| {
-                                line.strip_prefix("ref: refs/heads/")?
-                                    .strip_suffix("\tHEAD")
-                            })
-                            .context("Git remote has no default branch")?
-                            .to_owned(),
-                    )
-                }
-            };
-            let reference = match (&branch, checkout) {
-                (Some(name), _) => format!("refs/remotes/origin/{name}"),
-                (_, Some(GitCheckout::Commit { sha })) => sha.clone(),
-                _ => unreachable!(),
-            };
-            let revision = self
-                .git(
-                    &workspace,
-                    ["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
-                    None,
-                )?
-                .trim()
-                .to_owned();
+            let (branch, revision) =
+                self.resolve_checkout(&workspace, checkout.as_deref(), credential)?;
             tracing::info!(target: "exoharness::progress", "Checking out Git resource {}", repository);
             if let Some(name) = branch {
                 git_with_cancellation(

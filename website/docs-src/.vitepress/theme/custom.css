@@ -1,41 +1,147 @@
-/* Match the exoharness.ai landing page: warm-orange accent on a near-black
-   dark theme, mono brand. */
+/* Match the exoharness.ai landing page: white or charcoal paper, Charter for
+   prose, system mono for code, and blue as the only accent. */
 :root {
-  --vp-c-brand-1: #ffb088;
-  --vp-c-brand-2: #e58b5a;
-  --vp-c-brand-3: #e58b5a;
-  --vp-c-brand-soft: rgba(229, 139, 90, 0.16);
+  --vp-font-family-base:
+    Charter, "Iowan Old Style", "Bitstream Charter", Georgia, serif;
+  --vp-font-family-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --vp-c-bg: #ffffff;
+  --vp-c-bg-alt: #ffffff;
+  --vp-c-bg-elv: #ffffff;
+  --vp-c-bg-soft: #f6f6f7;
+
+  --vp-c-divider: #ececef;
+  --vp-c-border: #e2e2e6;
+  --vp-c-gutter: #ececef;
+
+  --vp-c-text-1: #17171a;
+  --vp-c-text-2: #6b6b73;
+  --vp-c-text-3: #9a9aa2;
+
+  --vp-c-brand-1: #1f4fd1;
+  --vp-c-brand-2: #1a43b3;
+  --vp-c-brand-3: #1f4fd1;
+  --vp-c-brand-soft: rgba(31, 79, 209, 0.1);
+
+  --vp-code-color: var(--vp-c-text-1);
+
+  --vp-code-block-bg: var(--vp-c-bg-soft);
 }
 
 .dark {
-  --vp-c-bg: #111116;
-  --vp-c-bg-alt: #16161d;
-  --vp-c-bg-elv: #1b1b23;
-  --vp-c-bg-soft: #16161d;
+  --vp-c-bg: #141416;
+  --vp-c-bg-alt: #141416;
+  --vp-c-bg-elv: #1b1b1e;
+  --vp-c-bg-soft: #1b1b1e;
 
-  --vp-c-divider: #292932;
-  --vp-c-border: #3c3c47;
-  --vp-c-gutter: #0d0d11;
+  --vp-c-divider: #26262a;
+  --vp-c-border: #333338;
+  --vp-c-gutter: #26262a;
 
-  --vp-c-text-1: #d1d1d6;
-  --vp-c-text-2: #aaaab2;
-  --vp-c-text-3: #64646f;
+  --vp-c-text-1: #e6e6e9;
+  --vp-c-text-2: #8e8e97;
+  --vp-c-text-3: #5c5c64;
 
-  --vp-c-brand-1: #ffb088;
-  --vp-c-brand-2: #e58b5a;
-  --vp-c-brand-3: #e58b5a;
-  --vp-c-brand-soft: rgba(229, 139, 90, 0.16);
+  --vp-c-brand-1: #82a8ff;
+  --vp-c-brand-2: #a3bfff;
+  --vp-c-brand-3: #82a8ff;
+  --vp-c-brand-soft: rgba(130, 168, 255, 0.14);
+
 }
 
-/* Mono brand mark, like the landing header. */
+/* ThemeSwitch.vue replaces the two-state default switch. */
+.VPNavBarAppearance,
+.VPNavScreenAppearance {
+  display: none !important;
+}
+
+/* Mono brand mark in ink, like the landing header. */
 .VPNavBarTitle .title {
   font-family: var(--vp-font-family-mono);
-  font-weight: 700;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--vp-c-text-1);
+  border-bottom-color: transparent !important;
+}
+
+.vp-doc {
+  font-size: 17px;
+}
+
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3 {
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.vp-doc h2 {
+  border-top: 0;
+}
+
+/* Code reads like the landing page's file: no box, just mono on paper. */
+.vp-doc div[class*="language-"] {
+  margin: 20px 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.vp-doc div[class*="language-"] pre {
+  padding: 4px 0;
+}
+
+.vp-doc div[class*="language-"] code {
+  padding: 0;
+}
+
+.vp-doc div[class*="language-"] > span.lang {
+  display: none;
+}
+
+.vp-doc :not(pre) > code {
+  padding: 0;
+  background: transparent;
+  color: var(--vp-c-text-1);
+}
+
+/* Callouts are quiet notes, not colored panels. */
+.vp-doc .custom-block {
+  border: 0;
+  border-left: 2px solid var(--vp-c-divider);
+  border-radius: 0;
+  padding: 2px 0 2px 18px;
+  background: transparent;
+  color: var(--vp-c-text-2);
+}
+
+.vp-doc .custom-block .custom-block-title {
+  color: var(--vp-c-text-1);
+}
+
+.vp-doc .custom-block a {
   color: var(--vp-c-brand-1);
 }
 
-/* Slightly tighter, docs-like code blocks. */
-.vp-doc div[class*="language-"] {
-  border: 1px solid var(--vp-c-divider);
-  border-radius: 10px;
+/* Nav and sidebar: ink and soft grey, no rules. VitePress scopes its own
+   styles with attribute selectors, so these need !important to win. */
+.VPNavBar .divider-line,
+.VPNavBar.has-sidebar .curtain {
+  background-color: transparent !important;
+}
+
+.VPNavBarMenuLink,
+.VPNavBarMenuLink.active {
+  color: var(--vp-c-text-2) !important;
+}
+
+.VPNavBarMenuLink:hover {
+  color: var(--vp-c-text-1) !important;
+}
+
+.VPSidebar .group + .group {
+  border-top: 0 !important;
+}
+
+.VPNavBar .vp-external-link-icon::after {
+  display: none !important;
 }

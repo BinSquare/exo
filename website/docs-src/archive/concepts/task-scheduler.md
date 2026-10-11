@@ -1,19 +1,25 @@
 ---
+search: false
 title: Task Scheduler
 description: Run recurring work in a sandbox on a schedule, with each run waking the conversation.
 ---
 
 # Task Scheduler
 
+::: warning Archived documentation
+This page describes the earlier Exo self-agent or older APIs and may be out of date. See the [current docs](/).
+These pages use older CLI and configuration syntax. The current local state directory is `~/.exo`; managed agents use `thread fork --up-to` rather than the older clone, rewind, or migrate commands.
+:::
+
 The **task scheduler** runs recurring work in a sandbox on a schedule —
 independent of whether anyone is chatting. It's how a long-running agent
 does things like "check the BBC headlines every hour" or "run the test
 suite nightly."
 
-Like [tools](./tools), the scheduler is executor-level, not an
+Like [tools](tools), the scheduler is executor-level, not an
 exoharness primitive. The agent manages tasks through scheduler tools; a
 separate **scheduler runner** process owns timing and execution and is
-started as one of the [canonical agent's](./canonical-agent) services.
+started as one of the [canonical agent's](canonical-agent) services.
 
 ## Managing tasks
 
@@ -42,7 +48,7 @@ Each task records:
 
 | Mode | Runs in |
 |:-----|:--------|
-| `agent` | The shared, persistent agent [sandbox](./sandboxes) (default) |
+| `agent` | The shared, persistent agent [sandbox](/architecture/sandboxes) (default) |
 | `conversation` | This conversation's sandbox |
 | `task_fresh` | A separate sandbox created for the task and reused across its runs |
 
@@ -98,7 +104,7 @@ an older build is upgraded rather than silently reinterpreted.
 ## How a run reports back
 
 When a run finishes, the scheduler stores its output as an
-[artifact](./data-model) and **wakes the conversation** — it starts a
+[artifact](../../architecture/data-model) and **wakes the conversation** — it starts a
 new turn carrying a compact result guided by the task's `reportPrompt`. So
 scheduled work shows up in the conversation as if the agent had just done
 it, and the durable record (last run, next run, latest result) lives in the

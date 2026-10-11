@@ -465,9 +465,9 @@ ensure_adapters() {
   pid_file="$(adapters_pid_file)"
   log_file="$(adapters_log_file)"
   echo "Starting adapter runner..."
-  prepare_exo_args serve
+  prepare_exo_args run --serve
   nohup "$EXO_BIN" "${EXO_ARGS[@]}" --harness "$HARNESS" \
-    --agent "$AGENT" \
+    "$AGENT" \
       --adapters-only \
       --adapter-limit "$ADAPTER_LIMIT" \
       --drain-marker "$(adapters_restart_file)" \
@@ -574,10 +574,10 @@ PYTHON
   python3 - "$spec" "$AGENT_NAME" "$HARNESS" "$MODULE" "$MODEL" "$MODEL_CREDENTIAL" "$MODEL_BASE_URL" <<'PYTHON'
 import json, pathlib, sys
 path, name, harness, module, model, credential, base_url = sys.argv[1:]
-config = {"name": name, "harness": harness, "config": {"model": model, "credential": credential, "base_url": base_url or None, "module": str(pathlib.Path(module).resolve())}}
+config = {"name": name, "harness": harness, "model": {"name": model, "credential": credential, "base_url": base_url or None, "module": str(pathlib.Path(module).resolve())}}
 pathlib.Path(path).write_text("---\n" + json.dumps(config) + "\n---\nFollow the Exo harness instructions.\n")
 PYTHON
-  exo agent create "$AGENT_NAME" --slug "$AGENT" --file "$spec"
+  exo agent create "$spec" --name "$AGENT_NAME" --slug "$AGENT"
 }
 
 ensure_conversation() {
@@ -593,7 +593,7 @@ ensure_conversation() {
     exo thread update "$AGENT" "$CONVERSATION" --shell-program "$SHELL_PROGRAM" >/dev/null
     # Opening with EOF saves the environment without submitting a model turn,
     # so startup prompts, adapters, and later CLI calls use the same settings.
-    exo agent run --agent "$AGENT" --thread "$CONVERSATION" \
+    exo run "$AGENT" --thread "$CONVERSATION" \
       --environment-file "$environment" </dev/null >/dev/null
   fi
 }
@@ -628,7 +628,7 @@ provider = {"apple-container": "apple_container", "local-process": "local_proces
 mounts = [{"host_path": str(pathlib.Path(root).resolve()), "mount_path": repo_mount, "mode": "rw"}]
 if cli_root:
     mounts.append({"host_path": str(pathlib.Path(cli_root).resolve()), "mount_path": cli_mount, "mode": "rw"})
-environment = {"name": "launch", "config": {"provider": provider, "image": image, "enable_networking": networking == "enabled", "file_system_mounts": mounts}}
+environment = {"name": "launch", "provider": provider, "image": image, "enable_networking": networking == "enabled", "file_system_mounts": mounts}
 pathlib.Path(path).write_text(json.dumps(environment) + "\n")
 PYTHON
 }
@@ -688,7 +688,7 @@ stop_adapters() {
       terminate_process_tree "$pid"
     fi
   fi
-  pkill -f '(^|/)exo serve .*--adapters-only([[:space:]]|$)' >/dev/null 2>&1 || true
+  pkill -f '(^|/)exo run .*--serve.*--adapters-only([[:space:]]|$)' >/dev/null 2>&1 || true
   pkill -f "tsx exo/adapters/.*/worker.ts" >/dev/null 2>&1 || true
   rm -f "$pid_file"
 }
@@ -853,9 +853,9 @@ run_repl() {
   if [[ "$CONTROL" == true ]]; then
     run_control_repl "$scheduler_log_start_line" "$adapter_log_start_line"
   else
-    prepare_exo_args agent run
+    prepare_exo_args run
     exec "$EXO_BIN" "${EXO_ARGS[@]}" \
-      --agent "$AGENT" \
+      "$AGENT" \
       --thread "$CONVERSATION"
   fi
 }
@@ -907,7 +907,7 @@ run_control_repl() {
     start_control_log_tail "adapters" "$(adapters_log_file)" "$adapter_start_line"
   fi
 
-  prepare_exo_args agent run
+  prepare_exo_args run
   while true; do
     rm -f "$(repl_restart_file)"
     watch_repl_restart_request "$$" &
@@ -915,7 +915,7 @@ run_control_repl() {
 
     local repl_exit
     if "$EXO_BIN" "${EXO_ARGS[@]}" \
-      --agent "$AGENT" \
+      "$AGENT" \
       --thread "$CONVERSATION"; then
       repl_exit=0
     else

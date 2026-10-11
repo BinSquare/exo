@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="610" viewBox="0 0 960 610" role="img" aria-labelledby="title desc">
+  <title id="title">Exo runtime and harnesses</title>
+  <desc id="desc">Clients submit turns to Exo. A harness supplies model and context semantics. The exoharness stores durable state and manages sandboxes, vaults, and network policies. Native harness processes and commands run in the sandbox.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#a8a8b3"/></marker>
+  </defs>
+  <rect width="960" height="610" rx="18" fill="#1b1b1f"/>
+  <g font-family="system-ui, sans-serif" text-anchor="middle">
+    <rect x="260" y="28" width="440" height="66" rx="12" fill="#252529" stroke="#777783"/>
+    <text x="480" y="68" fill="#eeeef0" font-size="23" font-weight="600">Your application / CLI</text>
+    <path d="M 480 98 V 142" fill="none" stroke="#a8a8b3" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="588" y="125" fill="#c4c4ce" font-size="15">submit turns · watch events</text>
+    <rect x="60" y="150" width="840" height="160" rx="14" fill="#292329" stroke="#ffad86" stroke-width="2"/>
+    <text x="480" y="188" fill="#ffad86" font-size="25" font-weight="600">Harness semantics</text>
+    <text x="480" y="224" fill="#eeeef0" font-size="21">Codex · Claude Code · Pi · your own harness</text>
+    <text x="480" y="269" fill="#c4c4ce" font-size="18">Model calls · context · compaction · planning · tool use</text>
+    <path d="M 480 314 V 355" fill="none" stroke="#a8a8b3" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="60" y="364" width="510" height="194" rx="14" fill="#252529" stroke="#777783"/>
+    <text x="315" y="404" fill="#eeeef0" font-size="25" font-weight="600">Exoharness</text>
+    <text x="315" y="442" fill="#c4c4ce" font-size="18">Durable threads · turns · events · artifacts</text>
+    <text x="315" y="479" fill="#c4c4ce" font-size="18">Vaults · egress · sandbox lifecycle</text>
+    <text x="315" y="525" fill="#ffad86" font-size="17">Infrastructure independent of the harness</text>
+    <path d="M 575 459 H 613" fill="none" stroke="#a8a8b3" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="622" y="364" width="278" height="194" rx="14" fill="#252529" stroke="#777783"/>
+    <text x="761" y="404" fill="#eeeef0" font-size="25" font-weight="600">Sandbox</text>
+    <text x="761" y="442" fill="#c4c4ce" font-size="18">Processes · files</text>
+    <text x="761" y="479" fill="#c4c4ce" font-size="18">Native harness runtimes</text>
+    <text x="761" y="525" fill="#c4c4ce" font-size="17">Isolated execution</text>
+  </g>
+</svg>
