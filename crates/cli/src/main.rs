@@ -1111,6 +1111,9 @@ async fn run_selected(
             let mut progress = turn_display::TurnProgress::new();
             progress.set_status(Some("Preparing session".into()));
             if local {
+                managed_agents::check_model_credentials(
+                    harness.as_ref(), agent.as_ref(), conversation.as_ref(),
+                ).await?;
                 progress.wait(harness.start_inline_previews(agent.as_ref(), conversation.clone())).await?;
             }
             if let Some(previews) = progress.wait(harness.preview_urls(agent.as_ref(), conversation.clone())).await? {
