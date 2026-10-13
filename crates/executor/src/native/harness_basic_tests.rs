@@ -31,8 +31,8 @@ use crate::{
     LocalProvider, Runtime,
     harness_executor::{ExecutorStreamMode, HarnessExecutor, RecoveryRuntimeResolver},
     harness_executor::{RUNTIME_TURN_COMPLETED, TurnWork},
-    harness_tool::ensure_shell_sandbox,
     http_service::{RuntimeHttpService, server},
+    shell_tool::ensure_shell_sandbox,
 };
 
 struct RecoveryPolicy(Uuid7);
@@ -1061,7 +1061,17 @@ async fn completed_tool_result_survives_restart_before_next_tool_approval() -> R
         EventData::ToolResult { tool_call_id, .. } if tool_call_id == "write-call"
     )));
     runtime.shutdown().await?;
-    assert!(matches!(stream.next().await, Some(Err(_))));
+    assert!(matches!(
+        stream
+            .by_ref()
+            .filter(|event| futures::future::ready(!matches!(
+                event,
+                Ok(crate::ExecutionStreamEvent::Status { .. })
+            )))
+            .next()
+            .await,
+        Some(Err(_))
+    ));
     drop(thread);
     drop(agent);
     drop(runtime);
@@ -1304,7 +1314,17 @@ async fn interrupted_rlm_turn_is_failed_without_replaying_its_input() -> Result<
         .await?;
     tokio::time::timeout(Duration::from_secs(3), blocked_model.entered.notified()).await?;
     runtime.shutdown().await?;
-    assert!(matches!(stream.next().await, Some(Err(_))));
+    assert!(matches!(
+        stream
+            .by_ref()
+            .filter(|event| futures::future::ready(!matches!(
+                event,
+                Ok(crate::ExecutionStreamEvent::Status { .. })
+            )))
+            .next()
+            .await,
+        Some(Err(_))
+    ));
     drop(thread);
     drop(agent);
     drop(runtime);
@@ -1397,7 +1417,17 @@ async fn graceful_shutdown_leaves_active_turn_for_restart() -> Result<()> {
         .await?;
     tokio::time::timeout(Duration::from_secs(3), blocked_model.entered.notified()).await?;
     runtime.shutdown().await?;
-    assert!(matches!(turn_stream.next().await, Some(Err(_))));
+    assert!(matches!(
+        turn_stream
+            .by_ref()
+            .filter(|event| futures::future::ready(!matches!(
+                event,
+                Ok(crate::ExecutionStreamEvent::Status { .. })
+            )))
+            .next()
+            .await,
+        Some(Err(_))
+    ));
     let events = thread.get_events(None).await?.events;
     let turn_id = events
         .iter()

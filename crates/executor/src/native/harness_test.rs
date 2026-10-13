@@ -363,7 +363,11 @@ async fn queued_turn_waits_for_cancelled_execution_cleanup() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(1), executor.started.notified()).await?;
     executor.release.add_permits(1);
     assert!(matches!(
-        second.next().await.transpose()?,
+        (&mut second)
+            .filter(|event| !matches!(event, Ok(crate::ExecutionStreamEvent::Status { .. })))
+            .next()
+            .await
+            .transpose()?,
         Some(crate::ExecutionStreamEvent::Completed(_))
     ));
     runtime.shutdown().await?;

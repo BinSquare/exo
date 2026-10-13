@@ -1,3 +1,4 @@
+use crate::resources::git_progress;
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -262,12 +263,12 @@ impl ResourceStore {
                 ..
             } = &definition.source
             {
-                let variable = definition.git_credential_variable();
                 settings.extend([
                     (format!("credential.{url}.helper"), String::new()),
-                    (format!("credential.{url}.helper"), format!(
-                        "!f() {{ if [ \"$1\" = get ] && [ -n \"${{{variable}:-}}\" ]; then printf 'username=x-access-token\\npassword=%s\\n' \"${variable}\"; fi; }}; f"
-                    )),
+                    (
+                        format!("credential.{url}.helper"),
+                        definition.git_credential_helper(),
+                    ),
                     (format!("credential.{url}.useHttpPath"), "true".into()),
                 ]);
             }
@@ -809,22 +810,6 @@ where
         bail!("preparing Git resource: {}", message.trim());
     }
     Ok(String::from_utf8(output.stdout)?)
-}
-
-fn git_progress(line: &[u8]) -> Option<(&'static str, u8)> {
-    let line = std::str::from_utf8(line).ok()?.trim();
-    let line = line.strip_prefix("remote: ").unwrap_or(line);
-    let (phase, progress) = line.split_once(':')?;
-    let phase = match phase {
-        "Counting objects" => "Counting objects for",
-        "Compressing objects" => "Compressing objects for",
-        "Receiving objects" => "Downloading",
-        "Resolving deltas" => "Resolving deltas for",
-        "Updating files" => "Checking out",
-        _ => return None,
-    };
-    let percent = progress.split_once('%')?.0.trim().parse::<u8>().ok()?;
-    (percent <= 100).then_some((phase, percent))
 }
 
 fn command_output(

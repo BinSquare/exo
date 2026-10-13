@@ -1,8 +1,8 @@
 use super::transport::dns_response;
 use super::*;
-use crate::EgressCredentialBinding;
 use crate::egress_credentials::PLACEHOLDER_PREFIX;
 use crate::{CredentialInjectionLocation, CredentialNetworkPolicy};
+use crate::{EgressCredentialBinding, SandboxNetworkPolicy};
 use anyhow::bail;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
@@ -964,7 +964,7 @@ fn credential_networking_is_independent_of_environment_networking() -> Result<()
         Some(TestResolver::new()),
         Arc::new(PublicUpstreamResolver),
     )?;
-    assert!(state.unrestricted);
+    assert!(state.network.unrestricted());
     assert!(state.hosts.contains("api.test"));
     assert!(!state.hosts.contains("public.test"));
     assert!(!state.bindings[0].permits_header(&EgressDestination {

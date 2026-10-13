@@ -334,6 +334,18 @@ pub(crate) fn turn_stream(
                             approval: serde_json::from_value(payload)?,
                         })
                     }
+                    EventData::Custom {
+                        event_type,
+                        payload,
+                    } if event_type == crate::executor_types::RUNTIME_STATUS => {
+                        Some(Output::Status {
+                            message:
+                                serde_json::from_value::<crate::executor_types::RuntimeStatus>(
+                                    payload,
+                                )?
+                                .message,
+                        })
+                    }
                     EventData::Error { message, .. } => {
                         failure = Some(message);
                         None

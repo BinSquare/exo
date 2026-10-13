@@ -703,6 +703,7 @@ impl ChatRepl {
             .await?
         {
             match event {
+                ExecutionStreamEvent::Status { message } => progress.set_status(Some(message)),
                 ExecutionStreamEvent::ApprovalRequested { turn, approval } => {
                     progress.set_status(None);
                     assistant_line.finish(&mut stdout)?;

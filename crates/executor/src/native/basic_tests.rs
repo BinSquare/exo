@@ -466,7 +466,7 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
     while let Some(event) = stream.next().await {
         match event.expect("stream event should succeed") {
             ExecutionStreamEvent::Suspended(_) => panic!("unexpected turn suspension"),
-            ExecutionStreamEvent::FirstChunk { .. } => {}
+            ExecutionStreamEvent::Status { .. } | ExecutionStreamEvent::FirstChunk { .. } => {}
             ExecutionStreamEvent::Chunk(chunk) => {
                 for choice in chunk.choices {
                     if let Some(delta) = choice.delta_view()

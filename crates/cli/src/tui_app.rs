@@ -406,6 +406,7 @@ struct TuiApp {
     /// pauses while set so it never re-renders messages the streaming path
     /// already displayed.
     busy: Arc<AtomicBool>,
+    runtime_status: Option<String>,
     /// Whether the terminal reports mouse events to us (wheel scrolling).
     /// Toggled off to let the terminal's native text selection work.
     mouse_captured: bool,
@@ -452,6 +453,7 @@ impl TuiApp {
             history_pos: None,
             scrollback: 0,
             busy: Arc::new(AtomicBool::new(false)),
+            runtime_status: None,
             mouse_captured: true,
             selection: None,
             transcript_inner: Rect::ZERO,
@@ -884,6 +886,7 @@ impl TuiApp {
             AppEvent::Stream(event) => self.handle_stream_event(event),
             AppEvent::StreamError(error) => self.push_notice(&format!("stream error: {error}")),
             AppEvent::StreamDone => {
+                self.runtime_status = None;
                 self.approvals.clear();
                 self.busy.store(false, Ordering::Relaxed);
                 self.open_assistant = None;
@@ -907,7 +910,9 @@ impl TuiApp {
 
     fn handle_stream_event(&mut self, event: ExecutionStreamEvent) {
         match event {
+            ExecutionStreamEvent::Status { message } => self.runtime_status = Some(message),
             ExecutionStreamEvent::ApprovalRequested { turn, approval } => {
+                self.runtime_status = None;
                 self.push_notice(&format!(
                     "Permission required: {} {}",
                     approval.request.function_name,
@@ -915,8 +920,9 @@ impl TuiApp {
                 ));
                 self.approvals.push_back((turn, approval));
             }
-            ExecutionStreamEvent::FirstChunk { .. } => {}
+            ExecutionStreamEvent::FirstChunk { .. } => self.runtime_status = None,
             ExecutionStreamEvent::Chunk(chunk) => {
+                self.runtime_status = None;
                 let text = chunk_text(&chunk);
                 if !text.is_empty() {
                     self.append_assistant_text(&text);
@@ -927,6 +933,7 @@ impl TuiApp {
                 tool_name,
                 arguments,
             } => {
+                self.runtime_status = None;
                 self.open_assistant = None;
                 self.assistant_prefixed = false;
                 if let Some(rendered) = render_tool_call(&tool_name, &arguments, self.verbosity) {
@@ -1247,7 +1254,11 @@ impl TuiApp {
         let state = if !self.approvals.is_empty() {
             "waiting for approval".to_string()
         } else if self.is_busy() {
-            format!("{} thinking…", SPINNER[self.spinner_frame % SPINNER.len()])
+            format!(
+                "{} {}",
+                SPINNER[self.spinner_frame % SPINNER.len()],
+                self.runtime_status.as_deref().unwrap_or("thinking…")
+            )
         } else {
             "idle".to_string()
         };

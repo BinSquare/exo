@@ -62,29 +62,12 @@ impl CredentialClient {
         F: Fn(Option<String>) -> Fut,
         Fut: Future<Output = Result<T, HttpError>>,
     {
-        let credential = self
-            .credentials
-            .resolve(&self.server)
+        let (result, supplied) =
+            crate::send_authenticated(self.credentials.as_ref(), &self.server, call, |result| {
+                matches!(result, Err(HttpError::AuthRequired(_)))
+            })
             .await
             .map_err(credential_error)?;
-        let supplied = credential.is_some();
-        let result = match call(credential.as_ref().map(|c| c.token.clone())).await {
-            Err(HttpError::AuthRequired(challenge)) => {
-                if let Some(rejected) = credential
-                    && let Some(fresh) = self
-                        .credentials
-                        .refresh(&self.server, &rejected)
-                        .await
-                        .map_err(credential_error)?
-                    && fresh.token != rejected.token
-                {
-                    call(Some(fresh.token)).await
-                } else {
-                    Err(HttpError::AuthRequired(challenge))
-                }
-            }
-            result => result,
-        };
         result.map_err(|error| {
             if error.auth_challenge().is_some() {
                 TransportError::Client(ClientError {

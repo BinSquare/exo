@@ -33,7 +33,12 @@ export interface AgentConfig {
 
 export interface AgentSandboxConfig {
   image?: string | null;
-  provider: "daytona" | "apple_container" | "docker" | "local_process";
+  provider:
+    | "daytona"
+    | "apple_container"
+    | "docker"
+    | "local_process"
+    | "cloudflare";
   mounts: FileSystemMount[];
   enableNetworking: boolean;
   scope: "agent" | "conversation";
@@ -137,6 +142,7 @@ export interface ConversationConfig {
     | "apple_container"
     | "docker"
     | "local_process"
+    | "cloudflare"
     | null;
   shellProgram?: string | null;
   sandboxScope?: "agent" | "conversation" | null;

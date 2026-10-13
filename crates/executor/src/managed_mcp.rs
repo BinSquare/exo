@@ -1,22 +1,20 @@
-use crate::{AgentConfig, ConversationConfig};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use exo_managed_agents as managed;
 use exo_mcp::McpToolSet;
 use exoharness::{AgentHandle, ThreadHandle};
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
-pub(crate) struct PreparedMcp {
-    pub(crate) tools: Arc<McpToolSet>,
-    pub(crate) selection: Option<managed::vaults::VaultSelection>,
-    pub(crate) selection_is_new: bool,
-    pub(crate) config: exoharness::BasicExoHarnessConfig,
-    pub(crate) servers: Vec<exo_mcp::McpServerConfig>,
+pub struct PreparedMcp {
+    pub tools: Arc<McpToolSet>,
+    pub selection: Option<managed::vaults::VaultSelection>,
+    selection_is_new: bool,
+    pub servers: Vec<exo_mcp::McpServerConfig>,
 }
 
-pub(crate) async fn connect_mcp(
+pub async fn connect_mcp(
     agent: &dyn AgentHandle,
     thread: &dyn ThreadHandle,
-    config: &exoharness::BasicExoHarnessConfig,
+    connector: &dyn exo_mcp::McpConnector,
 ) -> Result<PreparedMcp> {
     let vaults = thread.list_vaults().await?;
     let saved = managed::vaults::load_selection(thread).await?;
@@ -34,7 +32,10 @@ pub(crate) async fn connect_mcp(
         Some(selection) => {
             selection.validate_servers(&servers)?;
             let credentials = managed::vaults::VaultMcpCredentials::new(vaults, selection.clone());
-            Arc::new(McpToolSet::connect_with_provider(&servers, Arc::new(credentials)).await?)
+            Arc::new(
+                McpToolSet::connect_with_connector(&servers, Arc::new(credentials), connector)
+                    .await?,
+            )
         }
         None => Arc::default(),
     };
@@ -42,48 +43,24 @@ pub(crate) async fn connect_mcp(
         tools,
         selection,
         selection_is_new,
-        config: config.clone(),
         servers,
     })
 }
 
 impl PreparedMcp {
-    pub(crate) fn validate_thread(
-        &self,
-        agent_config: &AgentConfig,
-        config: &ConversationConfig,
-    ) -> Result<()> {
-        let provider = config
-            .sandbox_provider
-            .as_ref()
-            .unwrap_or(&agent_config.sandbox.provider);
-        if *provider != exoharness::SandboxProvider::LocalProcess {
-            for mount in agent_config
-                .sandbox
-                .mounts
-                .iter()
-                .chain(config.mounts.iter())
-            {
-                self.config
-                    .validate_secret_mount(Path::new(&mount.host_path))?;
-            }
-        } else if let Some(selection) = &self.selection
-            && (selection.vaults.len() > 1 || selection.bindings.iter().any(|b| b.secret.is_some()))
-        {
-            bail!(
-                "vault-backed chat requires an isolated sandbox; local-process can read host credentials"
-            );
-        }
+    pub async fn validate_configuration(&self, agent: &dyn AgentHandle) -> Result<()> {
+        let servers = match managed::load_definition(agent).await? {
+            Some(definition) => definition.resolve_mcp_servers(&()).await?,
+            None => vec![],
+        };
+        anyhow::ensure!(
+            self.servers == servers,
+            "MCP configuration changed; start a new thread"
+        );
         Ok(())
     }
 
-    pub(crate) async fn configure_thread(
-        &self,
-        agent_config: &AgentConfig,
-        conversation: &dyn ThreadHandle,
-        config: &ConversationConfig,
-    ) -> Result<()> {
-        self.validate_thread(agent_config, config)?;
+    pub async fn configure_thread(&self, conversation: &dyn ThreadHandle) -> Result<()> {
         if self.selection_is_new
             && let Some(selection) = &self.selection
         {
